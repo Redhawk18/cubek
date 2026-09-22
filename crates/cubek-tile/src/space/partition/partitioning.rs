@@ -9,13 +9,9 @@ use crate::{
 
 /// A space with the levels that partition it: what a kernel's loops are stated over.
 ///
-/// The two are one value because they are never separately true. A `Space` is the axes and
-/// their extents; a `Level` cuts *that* space, and its child spaces below. Held apart they are
-/// two arguments a call site states in the right order or the wrong one, and nothing says which
-/// space a list of levels was cut for — the mismatch compiles, and a level that names an axis
-/// the space does not hold, or an edge the extents never asked for, becomes a wrong answer
-/// rather than a refusal. Held together, everything read off the pair — the leaf, the overhangs,
-/// the grid — is a method, and there is no second space to read it against.
+/// One value because they are never separately true: a `Level` cuts *that* `Space`. Held apart,
+/// nothing says which space the levels were cut for: a level naming an axis the space lacks is a
+/// wrong answer, not a refusal. Held together, every read is a method; there is no second space.
 ///
 /// It is the pair, not a new statement: the levels are the kernel's, outermost first, and
 /// nothing here reorders or invents one. What the kernel *does* with a level — where it opens an
@@ -23,8 +19,7 @@ use crate::{
 ///
 /// What a kernel is handed ([`Launcher::partitioning_arg`](crate::Launcher::partitioning_arg)),
 /// and what its loops iterate: `for cube in space` deals the first level, `for plane in cube` the
-/// next, down to the leaf. The levels ride along comptime; the space's dynamic extents are the
-/// runtime half.
+/// next, down to the leaf. Levels are comptime; the space's dynamic extents are the runtime half.
 #[derive(CubeType, CubeLaunch, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Partitioning {
     pub(crate) space: Space,
@@ -43,47 +38,60 @@ impl PartitioningExpand {
     pub fn space(&self) -> Space {
         self.space.clone()
     }
-
-    pub fn levels(&self) -> Vec<Level> {
-        self.levels.clone()
-    }
-
-    pub fn level(&self, i: usize) -> Level {
-        self.levels[i].clone()
-    }
-
-    pub fn depth(&self) -> usize {
-        self.levels.len()
-    }
-
-    pub fn rank(&self) -> usize {
-        self.space.rank()
-    }
-
-    pub fn axis_at(&self, i: usize) -> Axis {
-        self.space.axis_at(i)
-    }
-
-    pub fn extent(&self, axis: Axis) -> usize {
-        self.space.extent(axis)
-    }
-
-    pub fn contains(&self, axis: Axis) -> bool {
-        self.space.contains(axis)
-    }
-
-    pub fn position(&self, axis: Axis) -> usize {
-        self.space.position(axis)
-    }
-
-    pub fn project(&self, axes: &[Axis]) -> Space {
-        self.space.project(axes)
-    }
-
-    pub fn axes(&self) -> Vec<Axis> {
-        self.space.axes()
-    }
 }
+
+/// The comptime reads of a partitioning, the same on the host and on the expand type: its
+/// levels, and its space's axes read through the pair.
+macro_rules! partitioning_reads {
+    ($ty:ty) => {
+        impl $ty {
+            /// The levels, outermost first — one per loop the kernel writes.
+            pub fn levels(&self) -> &[Level] {
+                &self.levels
+            }
+
+            /// Level `i`, outermost first: what a kernel states its `i`-th loop with.
+            pub fn level(&self, i: usize) -> Level {
+                self.levels[i].clone()
+            }
+
+            /// How many levels there are, which is how deep the nest goes.
+            pub fn depth(&self) -> usize {
+                self.levels.len()
+            }
+
+            pub fn rank(&self) -> usize {
+                self.space.rank()
+            }
+
+            pub fn axis_at(&self, i: usize) -> Axis {
+                self.space.axis_at(i)
+            }
+
+            pub fn extent(&self, axis: Axis) -> usize {
+                self.space.extent(axis)
+            }
+
+            pub fn contains(&self, axis: Axis) -> bool {
+                self.space.contains(axis)
+            }
+
+            pub fn position(&self, axis: Axis) -> usize {
+                self.space.position(axis)
+            }
+
+            pub fn project(&self, axes: &[Axis]) -> Space {
+                self.space.project(axes)
+            }
+
+            pub fn axes(&self) -> impl Iterator<Item = Axis> + '_ {
+                self.space.axes()
+            }
+        }
+    };
+}
+partitioning_reads!(Partitioning);
+partitioning_reads!(PartitioningExpand);
 
 #[cube]
 impl Partitioning {
@@ -156,11 +164,6 @@ impl Partitioning {
         &self.space
     }
 
-    /// The levels, outermost first — one per loop the kernel writes.
-    pub fn levels(&self) -> &[Level] {
-        &self.levels
-    }
-
     /// This partitioning with a name for each of its axes, which is what prints a table worth
     /// reading: an [`Axis`] is a client-assigned index, so only the client can say what it
     /// stands for. An axis the labels do not name prints that index.
@@ -173,46 +176,6 @@ impl Partitioning {
     /// client's to say, the same way its names are.
     pub fn quadrant(&self, contraction: Contraction) -> Quadrant<'_> {
         Quadrant::new(self, contraction)
-    }
-
-    /// Level `i`, outermost first: what a kernel states its `i`-th loop with.
-    pub fn level(&self, i: usize) -> Level {
-        self.levels[i].clone()
-    }
-
-    /// How many levels there are, which is how deep the nest goes.
-    pub fn depth(&self) -> usize {
-        self.levels.len()
-    }
-
-    /// The pair, for a caller that has to hand the halves to something older.
-    pub fn into_parts(self) -> (Space, Vec<Level>) {
-        (self.space, self.levels)
-    }
-
-    /// The space's axes, read through the pair: what a kernel handed a partitioning asks of it.
-    pub fn rank(&self) -> usize {
-        self.space.rank()
-    }
-
-    pub fn axis_at(&self, i: usize) -> Axis {
-        self.space.axis_at(i)
-    }
-
-    pub fn extent(&self, axis: Axis) -> usize {
-        self.space.extent(axis)
-    }
-
-    pub fn contains(&self, axis: Axis) -> bool {
-        self.space.contains(axis)
-    }
-
-    pub fn position(&self, axis: Axis) -> usize {
-        self.space.position(axis)
-    }
-
-    pub fn project(&self, axes: &[Axis]) -> Space {
-        self.space.project(axes)
     }
 
     /// The leaf the levels reach: each level's child of the last, the tile the operands are

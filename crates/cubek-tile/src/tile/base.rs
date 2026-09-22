@@ -10,8 +10,7 @@ use crate::*;
 
 /// A tile's backing store. Every variant is lifetime-free (a `Box<[T]>` or a
 /// [`cmma::Matrix`](cubecl::cmma::Matrix)); [`view`](Tile::view) rebuilds a borrowed view on
-/// demand. `Clone` copies the handle, not the cells, which is how later ring slots reuse a fixed
-/// operand's first buffer and is only sound where nothing rewrites the buffer afterwards.
+/// demand. `Clone` copies the handle, not the cells: sound only where nothing rewrites the buffer.
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub enum TileKind<T: Numeric> {
@@ -35,9 +34,10 @@ pub enum TileKind<T: Numeric> {
 
 /// One operand's data: a runtime [`TileKind`] backing store and the comptime [`Space`] it
 /// projects. `T` is the element the tile serves and computes in; its physical vector width is a
-/// storage detail inside the [`TileKind`], read back with [`vector_size`](Tile::vector_size).
-/// What an operand is at the leaf is what the kernel made it (a memory window, a stage, a plane
-/// fragment), so operands that disagree meet the kind-pairing panics there.
+/// [`TileKind`] storage detail, read back with [`vector_size`](Tile::vector_size).
+///
+/// An operand's kind is what the kernel made it (a memory window, a stage, a plane fragment), so
+/// operands that disagree meet the leaf's kind-pairing panics.
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub struct Tile<T: Numeric> {
@@ -55,9 +55,8 @@ pub struct Tile<T: Numeric> {
 }
 
 /// The one physical dim whose bound is `axis`'s own extent: it carries `axis` alone, at
-/// coefficient `1`. `None` otherwise, which is either of the two ways a bound stops being that
-/// extent: a gather, where the dim holds the receptive field several axes reach over, and storage
-/// tiling, where the extent is the product over the dims the axis is split across.
+/// coefficient `1`. `None` for a gather (the dim holds a receptive field several axes reach over)
+/// and for storage tiling (the extent is the product over the dims the axis is split across).
 fn bound_states(projection: &Projection, axis: Axis) -> Option<usize> {
     // A broadcast axis has no dim to read a bound off: the operand is constant along it, so its
     // buffer holds nothing that sizes it.
@@ -84,6 +83,35 @@ fn bound_position(projection: &Projection, axis: Axis) -> usize {
 
 #[cube]
 impl<T: Numeric> Tile<T> {
+    /// This tile's memory store, for a reader that addresses bytes. `site` names the reader in
+    /// the refusal: a plane tile, a tensor-map source, a recipe and the plane's lanes have none.
+    pub(crate) fn mem(&self, #[comptime] site: &str) -> &MemData<T> {
+        match &self.tile_kind {
+            TileKind::Gmem(g) | TileKind::Smem(g) => g,
+            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
+                panic!("Tile::{site}: a plane tile has no memory view")
+            }
+            TileKind::TmaGmem(_) => panic!("Tile::{site}: a tma source has no element view"),
+            TileKind::Procedural(_) | TileKind::Lanes(_) => {
+                panic!("Tile::{site}: a procedural tile and the plane's lanes have no memory view")
+            }
+        }
+    }
+
+    /// The mutable twin of [`mem`](Tile::mem).
+    pub(crate) fn mem_mut(&mut self, #[comptime] site: &str) -> &mut MemData<T> {
+        match &mut self.tile_kind {
+            TileKind::Gmem(g) | TileKind::Smem(g) => g,
+            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
+                panic!("Tile::{site}: a plane tile has no memory view")
+            }
+            TileKind::TmaGmem(_) => panic!("Tile::{site}: a tma source is not writable"),
+            TileKind::Procedural(_) | TileKind::Lanes(_) => {
+                panic!("Tile::{site}: a procedural tile and the plane's lanes are not writable")
+            }
+        }
+    }
+
     /// Evaluate a procedural tile at scalar logical coordinates relative to its current region.
     pub fn procedural_value(&self, pos: Coords<u32>) -> T {
         match &self.tile_kind {
@@ -156,58 +184,12 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// What this tile's cells are to the plane's lanes: whole, or a partial only true once
-    /// combined across the plane. A resident form inherits it from the memory it was promoted
-    /// from: the split is the space's, not the storage's.
-    pub(crate) fn lane_share(&self) -> comptime_type!(LaneShare) {
-        match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.lanes.share,
-            TileKind::PlaneTile(_)
-            | TileKind::PlanePartition(_)
-            | TileKind::TmaGmem(_)
-            | TileKind::Procedural(_)
-            | TileKind::Lanes(_) => {
-                comptime!(LaneShare::Whole)
-            }
-        }
-    }
-
-    /// What one instance holds of this tile's cells. A form that is not memory holds whole cells
-    /// by construction: it is a plane's own registers, which no other instance writes.
-    pub(crate) fn split_share(&self) -> comptime_type!(SplitShare) {
-        match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => comptime!(d.split_share),
-            TileKind::PlaneTile(_)
-            | TileKind::PlanePartition(_)
-            | TileKind::TmaGmem(_)
-            | TileKind::Procedural(_)
-            | TileKind::Lanes(_) => {
-                comptime!(SplitShare::Whole)
-            }
-        }
-    }
-
-    /// What a write to this tile does to the cell it lands on. A form that is not memory has no
-    /// cell to land on, so it answers with the only thing a later store into memory can be asked
-    /// to do, and the memory it drains into answers for itself.
-    pub(crate) fn write(&self) -> comptime_type!(Write) {
-        match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => comptime!(d.access.write),
-            TileKind::PlaneTile(_)
-            | TileKind::PlanePartition(_)
-            | TileKind::TmaGmem(_)
-            | TileKind::Procedural(_)
-            | TileKind::Lanes(_) => {
-                comptime!(Write::Replace)
-            }
-        }
-    }
-
-    /// Ask this accumulator to start from `init_from`, and answer what actually took. Asking
-    /// rather than deciding keeps a kind that cannot take the request from being listed anywhere
-    /// else. A destination that folds always answers [`Identity`](InitFrom::Identity): its cells
-    /// belong to several instances, so the buffer must already hold the fold's identity (the
-    /// launch's obligation), and `Cell` would seed a cell the siblings are folding into.
+    /// Ask this accumulator to start from `init_from`, and answer what actually took, so a kind
+    /// that cannot take the request is listed nowhere else.
+    ///
+    /// A folding destination always answers [`Identity`](InitFrom::Identity): its cells belong to
+    /// several instances, so the buffer must already hold the fold's identity (the launch's
+    /// obligation), and `Cell` would seed a cell the siblings are folding into.
     pub(crate) fn request_init_from(
         &mut self,
         #[comptime] init_from: InitFrom,
@@ -234,9 +216,8 @@ impl<T: Numeric> Tile<T> {
     }
 
     /// This operand's decode site ([`DequantAt`]). A tile with nothing to decode answers
-    /// [`DequantAt::Load`]: served and stored are the same element, so its load already delivers
-    /// what the read wants and the stage takes that element. A tma source is never quantized, so it
-    /// answers the same for the same reason, not because a bulk copy could decode: it cannot.
+    /// [`DequantAt::Load`]: served and stored are one element, so its load already delivers what
+    /// the read wants. A tma source is never quantized and answers the same; a bulk copy cannot.
     pub(crate) fn dequant_at(&self) -> comptime_type!(DequantAt) {
         match &self.tile_kind {
             TileKind::Gmem(d) | TileKind::Smem(d) => d.dequant_at(),
@@ -266,9 +247,8 @@ impl<T: Numeric> Tile<T> {
     }
 
     /// Whether this tile's buffer is addressed through a mapping whose windows may *overlap*, so
-    /// the only read surface describing it is the N-D one ([`nd`](Tile::nd)) and no window is
-    /// dense. False for a [`direct`](Projection::direct) operand and equally for one whose axes
-    /// [partition](Composition::Disjoint) a physical axis, a partition being a bijection.
+    /// only the N-D surface ([`nd`](Tile::nd)) describes it and no window is dense. False for
+    /// [`direct`](Projection::direct) and for a [partition](Composition::Disjoint), a bijection.
     pub fn gathered(&self) -> comptime_type!(bool) {
         let projection = self.projection();
         comptime!(projection.composition() == Composition::Overlapping)
@@ -303,9 +283,8 @@ impl<T: Numeric> Tile<T> {
     }
 
     /// The factorization this tile's values state, if any: `Some(n)` for a recipe presenting `n`
-    /// separable factors, `None` for a tile read from a buffer or a recipe that only answers as a
-    /// whole. A rank-one factorization is `Some(1)`, which a consumer can still exploit, and so is
-    /// deliberately not the same answer as `None`.
+    /// separable factors, `None` for a buffer or a recipe that only answers as a whole. Rank one is
+    /// `Some(1)`, deliberately distinct from `None`: a consumer can still exploit it.
     pub(crate) fn factors(&self) -> comptime_type!(Option<usize>) {
         match &self.tile_kind {
             TileKind::Procedural(data) => data.factors(),
@@ -398,25 +377,9 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The axes of `walk` this tile is constant along, so one read serves every position of all
-    /// of them at once. Two spellings, one fact: an axis the tile's space does not span, and an
-    /// axis it spans but whose projection addresses nothing. A consumer asking how far out of a
-    /// nest a read lifts wants both. The [gathered nest](crate::FactorReuse) asks the same of a
-    /// procedural factor through its recipe, which reads its axes rather than addressing them.
-    pub(crate) fn invariant_over(&self, #[comptime] walk: Space) -> comptime_type!(Vec<Axis>) {
-        let projection = self.projection();
-        comptime!(
-            walk.axes()
-                .filter(|axis| !self.space.contains(*axis) || !projection.addresses(*axis))
-                .collect::<Vec<_>>()
-        )
-    }
-
-    /// Whether this tile can state `axis`'s runtime size for its operation: it spans the axis
-    /// [`Dynamic`](crate::Extent), has a buffer to read a bound off, and that bound is the axis's
-    /// own extent ([`bound_states`]). Spanning an axis and being able to supply it are separate
-    /// questions, so an operation sizes each `Dynamic` axis from whichever operand witnesses it
-    /// and lets the others pass ([`witnessed_space`]).
+    /// Whether this tile can state `axis`'s runtime size: it spans it [`Dynamic`](crate::Extent),
+    /// has a buffer to read a bound off, and the bound is the axis's own extent ([`bound_states`]).
+    /// An operation sizes a `Dynamic` axis from any operand witnessing it ([`witnessed_space`]).
     pub fn witnesses(&self, #[comptime] axis: Axis) -> comptime_type!(bool) {
         let bounded = self.bounded();
         let projection = self.projection();
@@ -446,23 +409,12 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The same cells under another `space`: same axes, same extents, the same depth. What lets a
-    /// leaf window an operand whose cut is not the operand's own statement: the rhs of a
-    /// contraction is cut by the grid the contraction implies, and arrives whole.
-    ///
-    /// `Clone` on the store names the same storage, so a write through the result is a write
-    /// through this tile.
-    pub(crate) fn retiled(&self, #[comptime] space: Space) -> Tile<T> {
-        comptime!(assert!(
-            space.laid_out_like(&self.space),
-            "Tile::retiled: {space:?} holds other cells than {:?}",
-            self.space
-        ));
-        // A re-cut tile is a new nest: what descends it is stated against `space`, not against
-        // whatever walked the tile it was cut from.
+    /// This tile's place in its nest around another store: the same space, depth and levels,
+    /// which is what every window of a tile keeps.
+    pub(crate) fn with_kind(&self, tile_kind: TileKind<T>) -> Tile<T> {
         Tile::<T> {
-            tile_kind: self.tile_kind.clone(),
-            space,
+            tile_kind,
+            space: comptime!(self.space.clone()),
             depth: comptime!(self.depth),
             levels: comptime!(self.levels.clone()),
         }
@@ -478,18 +430,12 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// Window this tile down to `region`, no copy: the steps of the region's path below this
-    /// tile's depth, applied in turn. Each tile projects a step onto its own axes, so
-    /// `lhs ∈ {M,K}` and `out ∈ {M,N}` line up on their own; the caller never matches axes by
-    /// hand, and the root tile and a window of it read one region alike.
     /// This operand's window placed at `from` on `axis`, reading no further than `until`, both
-    /// counted in that axis's own elements.
+    /// counted in that axis's own elements. A region names a whole tile of an axis; this names an
+    /// element and where reads stop, both runtime, as a packed sequence's start and length are.
     ///
-    /// A region names a whole tile of an axis; this names an element and says where reads stop,
-    /// which a tile coordinate cannot. A packed sequence starts wherever the one before it ended
-    /// and runs for however long it is, so both halves are runtime. `until` arms
-    /// [`Boundary::Zero`] on the axis, so a last tile overrunning the range reads zero there
-    /// rather than the next sequence's values.
+    /// `until` arms [`Boundary::Zero`] on the axis, so a last tile overrunning the range reads zero
+    /// there rather than the next sequence's values.
     pub fn within(&self, #[comptime] axis: Axis, from: usize, until: usize) -> Tile<T> {
         let tile_kind = match &self.tile_kind {
             TileKind::Gmem(g) => TileKind::new_Gmem(g.within(axis, from, until)),
@@ -503,14 +449,12 @@ impl<T: Numeric> Tile<T> {
                  tensor-map source and a recipe have none"
             ),
         };
-        Tile::<T> {
-            tile_kind,
-            space: comptime!(self.space.clone()),
-            depth: comptime!(self.depth),
-            levels: comptime!(self.levels.clone()),
-        }
+        self.with_kind(tile_kind)
     }
 
+    /// Window this tile down to `region`, no copy: the steps of the region's path below this
+    /// tile's depth, applied in turn. Each tile projects a step onto its own axes, so `lhs ∈ {M,K}`
+    /// and `out ∈ {M,N}` line up without the caller matching axes; root and window read one region.
     pub fn at(&self, region: &Region) -> Tile<T> {
         let skip = comptime!({
             assert!(
@@ -559,62 +503,7 @@ impl<T: Numeric> Tile<T> {
                 ));
                 TileKind::new_PlaneTile(t.clone())
             }
-            // A partition selects under comptime coordinates (an unrolled walk folds regions
-            // to constants): each region owns a `sub_m × sub_n` block. An uncut level selects
-            // the whole partition; a 1×1 block is the tile itself. A runtime region passes the
-            // partition through whole, legal only on an uncut k-step level (the walk below
-            // then selects statically).
-            TileKind::PlanePartition(p) => {
-                let edges = comptime!(MatrixAxes::edges(&self.space));
-                let a0 = comptime!(self.space.axis_at(edges.row_split));
-                let a1 = comptime!(self.space.axis_at(edges.col_split));
-                // A single-tile static axis (k-step, no m/n cut) folds to constant `0`, so a
-                // cut axis takes its constant digit and an uncut one selects the whole
-                // partition. A `Dynamic` axis (top level only) stays runtime, yielding `None`.
-                let mi = if comptime!(step.level.single_static_tile(&self.space, a0)) {
-                    comptime!(Some(0u64))
-                } else {
-                    step.coord(a0).constant()
-                };
-                let ni = if comptime!(step.level.single_static_tile(&self.space, a1)) {
-                    comptime!(Some(0u64))
-                } else {
-                    step.coord(a1).constant()
-                };
-                match comptime!(mi.zip(ni)) {
-                    Some((c0, c1)) => {
-                        let (sub_m, sub_n) = comptime!({
-                            let (cm, cn) = (
-                                step.level.tiles(&self.space, a0),
-                                step.level.tiles(&self.space, a1),
-                            );
-                            assert!(
-                                p.m_tiles.is_multiple_of(cm) && p.n_tiles.is_multiple_of(cn),
-                                "Tile::at: the level's grid must divide the partition"
-                            );
-                            (p.m_tiles / cm, p.n_tiles / cn)
-                        });
-                        let mi = comptime!(c0 as usize * sub_m);
-                        let ni = comptime!(c1 as usize * sub_n);
-                        if comptime!(sub_m == 1 && sub_n == 1) {
-                            TileKind::new_PlaneTile(p.at(mi, ni))
-                        } else {
-                            TileKind::new_PlanePartition(p.window(mi, ni, sub_m, sub_n))
-                        }
-                    }
-                    // A runtime coordinate reaches here only from a `Dynamic` (top, instance)
-                    // level, which cuts nothing on m/n and passes the whole partition down to
-                    // the static levels below. A rolled *cut* would be a caller bug.
-                    None => {
-                        comptime!(assert!(
-                            !step.level.cuts_tiles(&self.space),
-                            "Tile::at: a level that cuts a partition must be \
-                             walked with compile-time coordinates (an unrolled walk)"
-                        ));
-                        TileKind::new_PlanePartition(p.clone())
-                    }
-                }
-            }
+            TileKind::PlanePartition(p) => p.at_step(step, comptime!(self.space.clone())),
         };
         Tile::<T> {
             tile_kind,
@@ -681,10 +570,9 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The regions of the level below this tile over its own box: its axes alone, so a loop
-    /// over one operand's windows (each lane's rows of an output) steps nothing the operand
-    /// does not span, where the kernel's space would. What `for plane in tile` iterates, as a
-    /// value.
+    /// The regions of the level below this tile over its own box, its axes alone: a loop over one
+    /// operand's windows steps nothing the operand does not span, where the kernel's space would.
+    /// What `for plane in tile` iterates, as a value.
     pub fn walk(&self) -> Walk {
         let space = self.runtime_space();
         Region::rooted(
@@ -712,9 +600,8 @@ impl<T: Numeric> Tile<T> {
     }
 
     /// Zero this tile: `mma` accumulates over whatever is there, so a routine whose contract is
-    /// `out = A·B` zeroes first. The whole window this tile holds, by every unit of the cube for
-    /// memory and every fragment for a partition; the levels a zero is split across are the
-    /// kernel's own loops, so a kernel zeroes the tile it holds where it holds it.
+    /// `out = A·B` zeroes first. Covers the whole window this tile holds (every cube unit for
+    /// memory, every fragment for a partition); the kernel's own loops split it across levels.
     pub fn zero(&mut self) {
         match &mut self.tile_kind {
             TileKind::Gmem(d) | TileKind::Smem(d) => d.zero(),
@@ -749,10 +636,9 @@ impl<T: Numeric> Tile<T> {
     /// Multiply every partial this accumulator holds by the one value `factor` carries, or by
     /// nothing where no factor was bound, which is multiplying by one.
     ///
-    /// A scale that covers everything the accumulator sums belongs here rather than on the terms:
-    /// it costs one multiply per cell instead of one per value read. A scale that does *not*
-    /// cover everything the accumulator sums cannot come here at all — the sum already holds
-    /// terms it does not apply to — and rides its factor instead ([`Tile::scaled`]).
+    /// A scale covering everything the accumulator sums belongs here rather than on the terms: one
+    /// multiply per cell instead of one per value read. A scale that does *not* cover everything
+    /// summed cannot come here at all and rides its factor instead ([`Tile::scaled`]).
     pub fn scale<S: Numeric>(&mut self, factor: &ComptimeOption<Tile<S>>) {
         #[comptime]
         match factor {
@@ -762,7 +648,7 @@ impl<T: Numeric> Tile<T> {
                     TileKind::PlaneTile(t) => t.scale(value),
                     TileKind::PlanePartition(p) => p.scale(value),
                     TileKind::Gmem(_) | TileKind::Smem(_) => panic!(
-                        "Tile::scale: a memory tile is scaled by the cube, not by one unit                          (Tile::mul)"
+                        "Tile::scale: a memory tile is scaled by the cube, not by one unit (Tile::mul)"
                     ),
                     TileKind::TmaGmem(_) | TileKind::Procedural(_) | TileKind::Lanes(_) => {
                         panic!("Tile::scale: not writable")
@@ -807,35 +693,16 @@ impl<T: Numeric> Tile<T> {
         }
     }
 
-    /// The window as one dense run of `Vector<T, W>` lines (`W` the store's
-    /// own width): index `i` reads line `origin + i`, one add and no layout
-    /// walk. See [`MemData::dense_lines`] for the (caller-owned) contiguity
-    /// contract; the streaming fold's operands satisfy it by construction.
+    /// The window as one dense run of `Vector<T, W>` lines (`W` the store's own width): index `i`
+    /// reads line `origin + i`, one add and no layout walk. See [`MemData::dense_lines`] for the
+    /// caller-owned contiguity contract; the streaming fold's operands satisfy it by construction.
     pub fn dense<W: Size>(&self) -> &[Vector<T, W>] {
-        match &self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.dense_lines::<W>(),
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::dense: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => panic!("Tile::dense: a tma source has no element view"),
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!("Tile::dense: a procedural tile and the plane's lanes have no memory view")
-            }
-        }
+        self.mem("dense").dense_lines::<W>()
     }
 
     /// The mutable twin of [`dense`](Tile::dense).
     pub(crate) fn dense_mut<W: Size>(&mut self) -> &mut [Vector<T, W>] {
-        match &mut self.tile_kind {
-            TileKind::Gmem(d) | TileKind::Smem(d) => d.dense_lines_mut::<W>(),
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::dense_mut: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => panic!("Tile::dense_mut: a tma source is not writable"),
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!("Tile::dense_mut: a procedural tile and the plane's lanes are not writable")
-            }
-        }
+        self.mem_mut("dense_mut").dense_lines_mut::<W>()
     }
 
     /// Move `src` into `self`, the physical pairing picking the instruction that does it. A
@@ -894,14 +761,13 @@ impl<T: Numeric> Tile<T> {
     /// accumulating in a narrower element drains through, register to register, without
     /// touching memory.
     ///
-    /// The counterpart of [`copy_cast_from`](Self::copy_cast_from), which drains a block *out*
-    /// to its sink. This one keeps it resident, and it exists so a leaf can contract in the
-    /// operands' own element while the sum across leaf calls stays wide. On a target with no
-    /// matrix units that is the whole difference between reaching the device's packed
-    /// instruction and not: an `f16` block reaches `hfma2`, twice the arithmetic of an `f32`
-    /// one, but `f16` counts integers exactly only to 2048, so a contraction accumulated in it
-    /// end to end stops advancing part way through. Promoting per leaf call bounds the error by
-    /// the leaf's own depth instead.
+    /// The resident counterpart of [`copy_cast_from`](Self::copy_cast_from), which drains a block
+    /// *out* to its sink. It lets a leaf contract in the operands' own element while the sum across
+    /// leaf calls stays wide, bounding the error by the leaf's own depth.
+    ///
+    /// On a target with no matrix units an `f16` block reaches `hfma2`, twice the arithmetic of an
+    /// `f32` one, but `f16` counts integers exactly only to 2048, so a contraction accumulated in
+    /// it end to end stops advancing part way through.
     ///
     /// Both sides are register blocks over one sink, so the add is line for line
     /// ([`RegisterData::add_cast_from`]). A partition promotes cell by cell.
@@ -968,11 +834,9 @@ impl<T: Numeric> Tile<T> {
             (TileKind::Gmem(d) | TileKind::Smem(d), TileKind::PlanePartition(s)) => {
                 s.fragment().add_from_scratch(d, space)
             }
-            _ => panic!(
-                "Tile::add_from_scratch: a spilled plane tile adds into memory. This is a \
-                         tuple match, which the cube macro reads as plain Rust, so the wildcard is \
-                         allowed here where a single-value match on the enum would need every arm."
-            ),
+            // A tuple match, which the cube macro reads as plain Rust, so the wildcard is allowed
+            // here where a single-value match on the enum would need every arm.
+            _ => panic!("Tile::add_from_scratch: a spilled plane tile adds into memory"),
         }
     }
 
@@ -983,11 +847,9 @@ impl<T: Numeric> Tile<T> {
     /// the other to the same window. An accumulator opened wider than the destination handed over
     /// resolves each region somewhere else and drains the wrong cells.
     ///
-    /// **The scratch's size decides the barrier count.** With one tile resident each tile drains on
-    /// its own, three cube-wide barriers apiece. With the whole partition resident no two tiles
-    /// share a slot, so every spill happens, then one barrier, then every add: two barriers for the
-    /// drain however many tiles it has. That is the whole reason the size is a setting
-    /// ([`Resident`]).
+    /// **The scratch's size decides the barrier count** ([`Resident`]). With one tile resident
+    /// each tile drains on its own, three cube-wide barriers apiece. With the whole partition
+    /// resident no two tiles share a slot: every spill, one barrier, every add, two in all.
     pub fn drained_into<Out: Numeric>(&self, dest: &Tile<Out>, #[comptime] cells: Option<Level>) {
         match cells {
             // A grid below the drain: one region of `cells` per tile of it.
@@ -1003,25 +865,25 @@ impl<T: Numeric> Tile<T> {
     fn drain_grid<Out: Numeric>(&self, dest: &Tile<Out>, #[comptime] cells: Level) {
         let resident = self.resident();
         if comptime!(!resident.bounces()) {
-            for region in dest.over(&comptime!(cells.clone())).unrolled() {
+            for region in dest.over(&cells).unrolled() {
                 let mut window = dest.at(&region);
                 window.copy_cast_from(&self.at(&region));
             }
         } else if comptime!(resident.drains_together()) {
             // Every tile has its own slot, so every spill can happen before any add.
             sync_cube();
-            for region in dest.over(&comptime!(cells.clone())).unrolled() {
+            for region in dest.over(&cells).unrolled() {
                 self.at(&region).spill_to_scratch();
             }
             sync_cube();
-            for region in dest.over(&comptime!(cells.clone())).unrolled() {
+            for region in dest.over(&cells).unrolled() {
                 let mut window = dest.at(&region);
                 window.add_from_scratch(&self.at(&region));
             }
             sync_cube();
         } else {
             // One slot between them, so each tile's spill and add pair off inside the loop.
-            for region in dest.over(&comptime!(cells.clone())).unrolled() {
+            for region in dest.over(&cells).unrolled() {
                 let mut window = dest.at(&region);
                 sync_cube();
                 self.at(&region).spill_to_scratch();
@@ -1073,51 +935,26 @@ impl<T: Numeric> Tile<T> {
             TileKind::Gmem(data) => {
                 let projection = comptime!(data.projection.clone());
                 if comptime!(projection.addresses(axis)) {
-                    let carriers = comptime!(projection.carriers(axis));
-                    let mut valid = true;
-                    #[unroll]
-                    for c in 0..comptime!(carriers.len()) {
-                        let pa = comptime!(carriers[c]);
-                        if comptime!(
-                            data.window.boundaries.get(pa).copied().flatten()
-                                == Some(Boundary::Zero)
-                        ) {
-                            valid = valid && data.window.axis_in_bounds(pos[pa], pa);
-                        }
-                    }
-                    valid
+                    data.window
+                        .axes_in_bounds(pos, comptime!(projection.carriers(axis).to_vec()))
                 } else {
                     true.runtime()
                 }
             }
-            // A staged operand answers against the window it was *filled from*: the fill wrote
-            // the boundary's value wherever a tap fell outside, and this window no longer says
-            // which cells those were. A stage recorded with no source window was never gathered,
-            // so nothing it holds came from a boundary and every tap is in bounds.
+            // A staged operand answers against the window it was *filled from*: the fill wrote the
+            // boundary's value wherever a tap fell outside, which this window no longer records. A
+            // stage with no source window was never gathered, so every tap is in bounds.
             TileKind::Smem(data) => {
                 let projection = comptime!(data.projection.clone());
                 #[comptime]
                 match &data.source_window {
                     ComptimeOption::Some(source) => {
-                        if comptime!(projection.logical_axes().contains(&axis)) {
-                            let carriers = comptime!(projection.carriers(axis));
-                            let mut valid = true;
-                            #[unroll]
-                            for c in 0..comptime!(carriers.len()) {
-                                let pa = comptime!(carriers[c]);
-                                if comptime!(
-                                    source.boundaries.get(pa).copied().flatten()
-                                        == Some(Boundary::Zero)
-                                ) {
-                                    valid = valid
-                                        && source.axis_in_bounds(
-                                            data.window.origin.at(pa),
-                                            pos[pa],
-                                            pa,
-                                        );
-                                }
-                            }
-                            valid
+                        if comptime!(projection.addresses(axis)) {
+                            source.axes_in_bounds(
+                                &data.window.origin,
+                                pos,
+                                comptime!(projection.carriers(axis).to_vec()),
+                            )
                         } else {
                             true.runtime()
                         }
@@ -1177,9 +1014,8 @@ impl<T: Numeric> TileExpand<T> {
 }
 
 /// `space` with each [`Dynamic`](crate::Extent) axis sized by the first of `a`, `b`, `c` that
-/// [`witnesses`](Tile::witnesses) it, which is how an operation turns its comptime space into the
-/// runtime one its loops walk. A fully-`Static` space short-circuits to no
-/// runtime sizes. One tile may stand for all three ([`runtime_space`](Tile::runtime_space)).
+/// [`witnesses`](Tile::witnesses) it: the runtime space an operation's loops walk. A fully-`Static`
+/// space short-circuits. One tile may stand for all three ([`runtime_space`](Tile::runtime_space)).
 #[cube]
 pub(crate) fn witnessed_space<A: Numeric, B: Numeric, C: Numeric>(
     #[comptime] space: Space,
@@ -1192,10 +1028,9 @@ pub(crate) fn witnessed_space<A: Numeric, B: Numeric, C: Numeric>(
         #[unroll]
         for p in 0..comptime!(space.rank()) {
             let axis = comptime!(space.axis_at(p));
-            // `sizes` is positional, so every axis pushes, but only a `Dynamic` one is ever read
-            // back ([`Extents::count`] folds a `Static` axis to its comptime extent). Fold it here
-            // too rather than asking an operand: one `Dynamic` axis must not make the `Static`
-            // ones unreadable on a tile that has no bound to answer with.
+            // `sizes` is positional, so every axis pushes, but [`Extents::count`] folds a `Static`
+            // axis to its comptime extent. Fold it here too rather than asking an operand: one
+            // `Dynamic` axis must not make the `Static` ones unreadable on a tile with no bound.
             let size = match comptime!(space.extent_raw(axis)) {
                 Extent::Static(n) => comptime!(n).runtime(),
                 Extent::Dynamic => {
@@ -1309,9 +1144,8 @@ mod tests {
     const B: Axis = Axis(1);
 
     /// The discrimination the operation space rests on: a bound is an axis's own extent only when
-    /// one dim carries that axis alone. The two ways it stops being one are a gather, whose dim
-    /// holds the receptive field its axes reach over, and storage tiling, which splits the extent
-    /// across dims so no single bound is it.
+    /// one dim carries that axis alone. A gather's dim holds a receptive field its axes reach over,
+    /// and storage tiling splits the extent across dims, so neither bound is it.
     #[test]
     fn bound_states_wants_one_dim_carrying_the_axis_alone() {
         let direct = Projection::direct(&[A, B]);

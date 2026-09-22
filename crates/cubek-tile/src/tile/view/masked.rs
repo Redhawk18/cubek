@@ -3,8 +3,6 @@ use cubecl::{
     std::tensor::{View, ViewMut, layout::Coordinates},
 };
 
-use super::CastViewMut;
-
 /// A masked view over a [`Tile`](crate::Tile): a [`View`] re-shaped by some layout plus
 /// its own comptime `check` flag, so the leaf zeroes reads / skips writes past the
 /// partial-tile overhang; `false` is the unchecked fast path.
@@ -32,9 +30,8 @@ impl<'a, T: CubePrimitive, C: Coordinates + 'a> MaskedView<'a, T, C> {
     }
 
     /// Whether `pos` lands on the operand's real data (`true` unconditionally when `check` is
-    /// `false`: the launch already proved every access in-bounds). A caller that cannot use
-    /// [`read`](Self::read)'s zeroed default, because its fold's identity is not zero (`Max`,
-    /// `Min`), queries this and selects its own fallback instead.
+    /// `false`: the launch already proved every access in-bounds). A fold whose identity is not
+    /// zero (`Max`, `Min`) cannot use [`read`](Self::read)'s zeroed default and selects its own.
     pub fn is_in_bounds(&self, pos: C) -> bool {
         if comptime!(self.check) {
             self.view.is_in_bounds(pos)
@@ -57,11 +54,6 @@ impl<'a, T: CubePrimitive, C: Coordinates + 'a> MaskedView<'a, T, C> {
 
     pub fn shape(&self) -> C {
         self.view.shape()
-    }
-
-    /// The view underneath, for a reader that wraps it in another one and re-masks the result.
-    pub(crate) fn into_view(self) -> View<'a, T, C> {
-        self.view
     }
 }
 
@@ -109,19 +101,5 @@ impl<'a, T: CubePrimitive, C: Coordinates + 'a> MaskedViewMut<'a, T, C> {
 
     pub fn shape(&self) -> C {
         self.view.shape()
-    }
-}
-
-#[cube]
-impl<'a, S: Numeric, V: Size, C: Coordinates + 'a> MaskedViewMut<'a, Vector<S, V>, C> {
-    /// These cells served at `E`: cast on the read, cast back on the write, masked the same.
-    /// What a consumer working in an element the cells are not stored at reads and writes
-    /// through.
-    pub(crate) fn cast<E: Numeric>(self) -> MaskedViewMut<'a, Vector<E, V>, C> {
-        let check = comptime!(self.check);
-        MaskedViewMut::<'a, Vector<E, V>, C>::new(
-            CastViewMut::<'a, S, E, V, C>::new(self.view).view_mut(),
-            check,
-        )
     }
 }

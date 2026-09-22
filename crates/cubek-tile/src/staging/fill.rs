@@ -1,8 +1,8 @@
-//! Building and filling the staging slots of a ring: the [`SlotPlan`] every slot shares, the
-//! shared-memory ring constructors ([`Ring::smem`] / [`Ring::smem_single`]), the fixed/streamed
-//! split ([`fill_fixed`](Staging::fill_fixed) / [`fill_streamed`](Staging::fill_streamed)), and
-//! the closure-driven [`fill`](Staging::fill) / [`consume`](Staging::consume) with their
-//! hand-written expands.
+//! Building and filling a ring's staging slots: the shared [`SlotPlan`], the shared-memory ring
+//! constructors ([`Ring::smem`] / [`Ring::smem_single`]), and the fixed/streamed split
+//! ([`fill_fixed`](Staging::fill_fixed) / [`fill_streamed`](Staging::fill_streamed)).
+//!
+//! The closure-driven [`fill`](Staging::fill) / [`consume`](Staging::consume) are expanded by hand.
 //!
 //! `fill`/`consume` are hand-written expand methods because a `Drop` guard can't emit a barrier
 //! op in cubecl and `#[cube]` rejects `impl Trait` args.
@@ -51,11 +51,9 @@ impl SlotPlan {
             "Staging: a slot that mixes a cooperative fill with a bulk copy cannot be filled by \
              a subset of the cube, and this walk sets {fillers} plane(s) aside to fill it"
         );
-        // Fix an operand only when its window is genuinely invariant across the walk. A barrier
-        // slot arrives `full` once per fill, so lifting one operand out of the joint per-region
-        // fill leaves the slot's parity counting fills that no longer happen; the whole slot
-        // streams instead. A dynamic level can't decide invariance at comptime. Both fall back
-        // to streaming.
+        // Fix an operand only when its window is invariant across the walk. A barrier slot arrives
+        // `full` once per fill, so lifting one operand out of the joint fill leaves its parity
+        // counting fills that no longer happen; that and a dynamic level fall back to streaming.
         let can_fix_invariants = op_space.is_static() && sync != Sync::Barrier;
         let planned_operands = operands
             .iter()
@@ -261,6 +259,7 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     /// Fill the fixed operand(s), those the walk leaves invariant, from `region`'s window.
     /// Their window never moves, so `region` is region 0 and this runs once, above the loop.
     /// A no-op when nothing is fixed, and when a later ring slot reuses the first's buffers.
+    #[allow(dead_code)] // Reached through its expand, from [`RingFill`].
     pub(crate) fn fill_fixed(&mut self, lhs: &Tile<Lhs>, rhs: &Tile<Rhs>, region: &Region) {
         let lhs_plan = self.plan(FIRST);
         let rhs_plan = self.plan(SECOND);
@@ -297,10 +296,9 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     }
 }
 
-// `fill`/`consume` take closures so the body stays caller-defined (fill each buffer however, run the
-// mma). They're provided for the `(Tile<Lhs>, Tile<Rhs>)` payload (not generic `T`): closure-parameter
-// inference can't resolve the projection `&mut T::ExpandType` through a generic `T`, but resolves the
-// concrete `TileExpand` fields of the pair directly.
+// `fill`/`consume` take closures so the body stays caller-defined. They're provided for the
+// `(Tile<Lhs>, Tile<Rhs>)` payload, not generic `T`: closure-parameter inference can't resolve
+// `&mut T::ExpandType` through a generic `T`, but resolves the pair's concrete `TileExpand` fields.
 impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     /// Producer: wait the slot is free, run `fill` over the staged buffers and the slot's
     /// [`Pipeline`], then publish. See [`StagingExpand::__expand_fill_method`].
@@ -309,10 +307,8 @@ impl<Lhs: Numeric, Rhs: Numeric> Staging<(Tile<Lhs>, Tile<Rhs>)> {
     }
 
     /// Consumer: wait the slot's fill, hand the two staged tiles to `compute`, then free the slot.
-    /// Each tile's bytes and runtime map were stored together by the producer. A payload the slot
-    /// filled is already this region's; an in-place one is the operand whole, and the caller
-    /// selects the region out of it ([`read_operand`]).
-    /// See [`StagingExpand::__expand_consume_method`].
+    /// A filled payload is already this region's; an in-place one is the whole operand, the caller
+    /// selecting the region ([`read_operand`]). See [`StagingExpand::__expand_consume_method`].
     pub fn consume(&mut self, _compute: impl FnOnce(&Tile<Lhs>, &Tile<Rhs>)) {
         unexpanded!()
     }
@@ -350,10 +346,9 @@ impl<T: Numeric> Ring<Tile<T>> {
         Ring::<Tile<T>>::smem_single_at(walk, input, storage, comptime!(None), depth)
     }
 
-    /// [`smem_single`](Ring::smem_single) with the stage served in `width`-wide lines rather
-    /// than the operand's own: the buffer owns its layout, so an axis global memory could not
-    /// vectorize still reaches the leaf in lines. The operand must be scalar and unquantized,
-    /// and its reads past the real extent masked, which is the launch's to state.
+    /// [`smem_single`](Ring::smem_single) with the stage served in `width`-wide lines, not the
+    /// operand's own: the buffer owns its layout, so an axis gmem cannot vectorize reaches the leaf
+    /// in lines. The operand must be scalar and unquantized, with reads past its extent masked.
     pub fn smem_single_at(
         walk: &Walk,
         input: &Tile<T>,
@@ -451,6 +446,7 @@ impl<T: Numeric> RingFill for RingExpand<Tile<T>> {
 #[cube]
 impl<T: Numeric> Staging<Tile<T>> {
     /// Fill the operand from `region`'s window if the walk leaves it fixed.
+    #[allow(dead_code)] // Reached through its expand, from [`RingFill`].
     pub(crate) fn fill_fixed(&mut self, input: &Tile<T>, region: &Region) {
         let plan = self.plan(FIRST);
         let fixed = comptime!(plan.mode == WindowMode::Fixed);
@@ -482,9 +478,8 @@ impl<T: Numeric> Staging<Tile<T>> {
     }
 
     /// Consumer: wait the slot's fill, hand the staged tile to `compute`, then free the slot.
-    /// Each tile's bytes and runtime map were stored together by the producer. A payload the slot
-    /// filled is already this region's; an in-place one is the operand whole, and the caller
-    /// selects the region out of it ([`read_operand`]).
+    /// A filled payload is already this region's; an in-place one is the whole operand, the caller
+    /// selecting the region ([`read_operand`]).
     pub fn consume(&mut self, _compute: impl FnOnce(&Tile<T>)) {
         unexpanded!()
     }

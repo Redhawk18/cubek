@@ -28,10 +28,9 @@ pub struct ProceduralData<T: Numeric> {
     /// comparison when only an unrelated axis has a trailing partial tile.
     #[cube(comptime)]
     bounded_axes: Vec<Axis>,
-    /// Requested factor normalization and the space whose complete factor runs it describes.
-    /// Only a separable contraction consumes it, because only that leaf knows the tap run
-    /// belonging to each factor. The original space lets the leaf reject an ancestor split that
-    /// would otherwise normalize each chunk independently.
+    /// Requested factor normalization and the space whose complete factor runs it describes. Only
+    /// a separable contraction consumes it, since only that leaf knows each factor's tap run; the
+    /// original space lets it reject an ancestor split that would normalize each chunk on its own.
     #[cube(comptime)]
     pub(crate) normalization: Option<(TapMask, DivGuard, Space)>,
     recipe: VirtualRecipe<T>,
@@ -43,6 +42,7 @@ pub struct ProceduralData<T: Numeric> {
 
 #[cube]
 impl<T: Numeric> ProceduralData<T> {
+    #[allow(dead_code)] // Reached through its expand, from [`Tile::procedural`].
     pub(crate) fn new_virtual(#[comptime] space: Space, recipe: VirtualRecipe<T>) -> Self {
         let mut origin = Coords::<u32>::new();
         let mut bound = Coords::<u32>::new();
@@ -120,6 +120,7 @@ impl<T: Numeric> ProceduralData<T> {
         self.recipe.factors()
     }
 
+    #[allow(dead_code)] // Reached through its expand, from [`Tile::factor_dependencies`].
     pub(crate) fn factor_reads_axis(
         &self,
         #[comptime] factor: usize,
@@ -165,6 +166,7 @@ impl<T: Numeric> ProceduralData<T> {
         }
     }
 
+    #[allow(dead_code)] // Reached through its expand, from the `ViewOperationsExpand` impl below.
     pub(crate) fn evaluate_dyn(&self, pos: &CoordsDyn, #[comptime] space: Space) -> T {
         let mut coords = Coords::<u32>::new();
         #[unroll]

@@ -1,8 +1,6 @@
-//! The 2-D matrix views over a [`Tile`]. Two [`Layout`]s re-view the tile's N-D [`Space`] as a
-//! plain [`Coords2d`] `(row, col)` matrix: [`TileMatrix`] pins a batch prefix and exposes a
-//! row group and a column group, each spanning as many axes as its edge needs. [`Tile::matrix`] and
-//! friends then wrap the result as a [`MatrixView`] (a [`MaskedView`] carrying the comptime
-//! overhang-`check` flag). Used by the matmul leaves and [`copy_2d()`].
+//! The 2-D matrix views over a [`Tile`]. [`TileMatrix`] is a [`Layout`] re-viewing the tile's N-D
+//! [`Space`] as a [`Coords2d`] `(row, col)` matrix: a pinned batch prefix, then a row group and a
+//! column group of as many axes as each edge needs. [`Tile::matrix`] wraps it as a [`MatrixView`].
 
 use cubecl::{
     prelude::*,
@@ -20,12 +18,9 @@ pub(crate) type MatrixViewMut<'a, T> = MaskedViewMut<'a, T, Coords2d>;
 /// axes, in the space's own order: a *batch* prefix already pinned to one matrix, then the axes
 /// `row` unravels over, then the axes `col` unravels over (the innermost a line count).
 ///
-/// One type because there is one concept. A plain batched matmul pins its leading axes and exposes
-/// exactly two, so both axes hold one axis and the unravels are the identity. A convolution
-/// contracts over its taps *and* its channels, which no pinning exposes as one edge, so its `k`
-/// group holds several. A [partitioned](Composition::Disjoint) axis is the same again: an operand
-/// spanning `(M, KB, KI)` reads as `M·KB` rows by `KI` columns, and the block index rides in the
-/// row group at extent `1`.
+/// One type because there is one concept. A plain batched matmul exposes exactly two axes, so the
+/// unravels are the identity. A convolution contracts over taps *and* channels, so its `k` group
+/// holds several; a [partitioned](Composition::Disjoint) `(M, KB, KI)` reads as `M·KB` by `KI`.
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub(crate) struct TileMatrix {
@@ -91,10 +86,9 @@ impl Layout for TileMatrix {
 /// Which of a tile's axes form the matrix a 2-D reader sees: a batch prefix pinned to one matrix,
 /// then the group `row` unravels over, then the group `col` unravels over.
 ///
-/// Stated rather than assumed, because the axes alone cannot say. `(M, KB, KI)` with the block
-/// index pinned to one block is a `M x KI` matrix, and `(B, M, K)` is a batch of `M x K` ones;
-/// both are rank 3. A caller that knows the matrix it wants says so, and a grouping that is not a
-/// face of the tile's box is refused here rather than read out of bounds.
+/// Stated rather than assumed, because the axes alone cannot say: `(M, KB, KI)` pinned to one
+/// block is an `M x KI` matrix and `(B, M, K)` a batch of `M x K` ones, both rank 3. A grouping
+/// that is not a face of the tile's box is refused here rather than read out of bounds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MatrixAxes {
     /// Where the row group starts; everything before it is batch.
@@ -118,10 +112,9 @@ impl MatrixAxes {
     /// The two edges a matrix reader takes as its rows and columns: the innermost axis, and the
     /// last axis above it of extent past one.
     ///
-    /// An axis of extent one is a number that folds away, so a split contraction's block digit or
-    /// a column tile's index does not stand between a fragment and its rows. What a fragment, a
-    /// partition and a trailing region read through, none of which knows a shape to find the
-    /// grouping from ([`find`](Self::find)).
+    /// An axis of extent one folds away, so a split contraction's block digit or a column tile's
+    /// index does not stand between a fragment and its rows. What a fragment, a partition and a
+    /// trailing region read through, none of which knows a shape to [`find`](Self::find) one from.
     pub fn edges(space: &Space) -> Self {
         let rank = space.rank();
         let col_split = rank - 1;
@@ -138,10 +131,9 @@ impl MatrixAxes {
 
     /// An accumulator's matrix, against the lhs it is contracted with.
     ///
-    /// The innermost axis is a column edge by construction: it is what the sink lines along. How
-    /// far the group reaches is not, and is read off the lhs: an axis the lhs spans stops it,
-    /// because an axis the lhs varies over has to be walked against the lhs rather than folded
-    /// into a column. The row edge is the axis before the group, and anything above it is batch.
+    /// The innermost axis is a column edge by construction (the sink lines along it); the group
+    /// reaches up to the first axis the lhs spans, which must be walked against the lhs rather than
+    /// folded into a column. The row edge is the axis before the group; anything above is batch.
     ///
     /// This is what lets a `[bm, bn]` scheme split `N` into a block index and a position inside
     /// it: both are the rhs's alone, so both are columns, where taking the last axis alone would
@@ -254,10 +246,9 @@ impl MatrixAxes {
 
 /// The leading (batch) extents a matrix index unravels over, in the space's axis order.
 ///
-/// A direct operand reads them off the window, which is the only place a
-/// [`Dynamic`](crate::Extent::Dynamic) top-level axis carries a size. A gathered one reads them
-/// off the space: its window is boxed in *physical* axes, which are fewer than the logical ones
-/// and are combinations of them, so no entry of it sizes a logical axis.
+/// A direct operand reads them off the window, the only place a [`Dynamic`](crate::Extent::Dynamic)
+/// top-level axis carries a size. A gathered one reads them off the space: its window is boxed in
+/// *physical* axes, fewer than the logical ones and combinations of them, so none sizes a logical.
 #[cube]
 fn leading_extents(
     bound: &Coords<u32>,
@@ -298,9 +289,8 @@ pub(crate) fn batch_matrix(
             .product::<usize>()
     );
     // Rounded up like the buffer's own line count (`storage_extents`): a padded stage's innermost
-    // extent need not fill whole lines, and the box a checked read tests against has to include
-    // the partial last one it really holds. `cols` is a shape here, never a stride, so this only
-    // widens the bound.
+    // extent need not fill whole lines, and a checked read's box must include the partial last one
+    // it really holds. `cols` is a shape here, never a stride, so this only widens the bound.
     let cols = comptime!(
         line_extents(space, vector_size, axes.col_split, rank)
             .iter()
@@ -444,128 +434,23 @@ pub(crate) fn projected_whole_matrix(
 
 #[cube]
 impl<T: Numeric> Tile<T> {
-    /// The `i`-th batch matrix over `Vector<T, W>` lines (`W` = [`width`](Tile::width)).
+    /// The `i`-th batch matrix over the trailing two axes, in `Vector<T, W>` lines (`W` =
+    /// [`vector_size`](Tile::vector_size)), read through whatever [`Packing`] this tile carries.
     pub fn matrix<W: Size>(&self, i: usize) -> MatrixView<'_, Vector<T, W>> {
-        let vector_size = self.vector_size();
-        match &self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => {
-                let bound = g.extent();
-                let layout = projected_batch_matrix(
-                    &bound,
-                    comptime!(self.space.clone()),
-                    comptime!(g.projection.clone()),
-                    g.map.clone(),
-                    vector_size,
-                    comptime!(MatrixAxes::trailing_pair(&self.space)),
-                    i,
-                );
-                g.masked::<W, Coords2d, ProjectedMatrix>(layout, comptime!(Guard::Checked))
-            }
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::matrix: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => panic!("Tile::matrix: a tma source has no element view"),
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!("Tile::matrix: a procedural tile and the plane's lanes have no memory view")
-            }
-        }
+        self.matrix_packed::<W>(comptime!(MatrixAxes::trailing_pair(&self.space)), i)
     }
 
-    /// Mutable version of [`matrix`](Tile::matrix). Refused where two logical positions can share
-    /// a cell, which is the only way a write aliases.
-    pub(crate) fn matrix_mut<W: Size>(&mut self, i: usize) -> MatrixViewMut<'_, Vector<T, W>> {
-        let vector_size = self.vector_size();
-        match &mut self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => {
-                comptime!(assert!(
-                    g.projection.composition() != Composition::Overlapping,
-                    "Tile::matrix_mut: an overlapping operand aliases under a write"
-                ));
-                let bound = g.extent();
-                let layout = projected_batch_matrix(
-                    &bound,
-                    comptime!(self.space.clone()),
-                    comptime!(g.projection.clone()),
-                    g.map.clone(),
-                    vector_size,
-                    comptime!(MatrixAxes::trailing_pair(&self.space)),
-                    i,
-                );
-                g.masked_mut::<W, Coords2d, ProjectedMatrix>(layout)
-            }
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::matrix_mut: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => panic!("Tile::matrix_mut: a tma source has no element view"),
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!("Tile::matrix_mut: a procedural tile and the plane's lanes are not writable")
-            }
-        }
-    }
-
-    /// The `i`-th batch matrix, read through whatever [`Packing`] this tile carries.
-    ///
-    /// The one place a packing becomes a storage element: every leaf used to re-derive the
-    /// `i8`/`u32` choice from a bare factor, and the return type never mentions it.
+    /// The `i`-th batch matrix over the axes `axes` names, read through whatever [`Packing`]
+    /// this tile carries: a plain tile as it stands, a packed one unpacked at the read, a
+    /// quantized one dequantized per its scheme, with no dequantize-into-`f32` fill.
     pub fn matrix_packed<W: Size>(
         &self,
         #[comptime] axes: MatrixAxes,
         i: usize,
     ) -> MatrixView<'_, Vector<T, W>> {
-        let served = self.vector_size();
-        let packing = self.packing();
-        let physical = comptime!(packing.physical(served));
-        match comptime!(packing) {
-            Packing::Plain => {
-                let size!(WP) = physical;
-                self.matrix_transparent::<T, WP, W>(axes, i)
-            }
-            Packing::Native => {
-                let size!(WP) = physical;
-                self.matrix_transparent::<i8, WP, W>(axes, i)
-            }
-            Packing::Packed { field: _ } => {
-                let size!(WP) = physical;
-                self.matrix_transparent::<u32, WP, W>(axes, i)
-            }
-        }
-    }
-
-    /// [`matrix_packed`](Tile::matrix_packed) at a stated storage element `I` and physical line
-    /// `WP`: a plain tile is read as it stands, a quantized one dequantizes each `(row, col)` per
-    /// its scheme, with no dequantize-into-`f32` fill.
-    pub fn matrix_transparent<I: Numeric, WP: Size, W: Size>(
-        &self,
-        #[comptime] axes: MatrixAxes,
-        i: usize,
-    ) -> MatrixView<'_, Vector<T, W>> {
-        let vector_size = self.vector_size();
-        match &self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => {
-                let bound = g.extent();
-                let layout = projected_batch_matrix(
-                    &bound,
-                    comptime!(self.space.clone()),
-                    comptime!(g.projection.clone()),
-                    g.map.clone(),
-                    vector_size,
-                    axes,
-                    i,
-                );
-                g.matrix_transparent::<I, WP, W, ProjectedMatrix>(layout)
-            }
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::matrix_transparent: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => {
-                panic!("Tile::matrix_transparent: a tma source has no element view")
-            }
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!(
-                    "Tile::matrix_transparent: a procedural tile and the plane's lanes have no memory view"
-                )
-            }
-        }
+        let g = self.mem("matrix");
+        let layout = g.batch_matrix(comptime!(self.space.clone()), axes, i);
+        g.packed::<W, Coords2d, ProjectedMatrix>(layout, comptime!(Guard::Checked))
     }
 
     /// The fragment's grouped matrix, read through whatever [`Packing`] this tile carries. The
@@ -577,59 +462,22 @@ impl<T: Numeric> Tile<T> {
         #[comptime] rows: usize,
         #[comptime] cols: usize,
     ) -> MatrixView<'_, Vector<T, W>> {
-        let served = self.vector_size();
-        let packing = self.packing();
-        let physical = comptime!(packing.physical(served));
-        match comptime!(packing) {
-            Packing::Plain => {
-                let size!(WP) = physical;
-                self.fragment_matrix::<T, WP, W>(rows, cols)
-            }
-            Packing::Native => {
-                let size!(WP) = physical;
-                self.fragment_matrix::<i8, WP, W>(rows, cols)
-            }
-            Packing::Packed { field: _ } => {
-                let size!(WP) = physical;
-                self.fragment_matrix::<u32, WP, W>(rows, cols)
-            }
-        }
+        let g = self.mem("fragment_matrix");
+        let layout = g.whole_matrix(comptime!(self.space.clone()), rows, cols);
+        g.packed::<W, Coords2d, ProjectedMatrix>(layout, comptime!(Guard::Checked))
     }
 
-    /// [`fragment_matrix_packed`](Tile::fragment_matrix_packed) at a stated storage element:
-    /// several logical axes may flatten into one edge, so an operand whose contraction spans its
-    /// taps *and* its channels still has a `k` edge, and a gathered one reads it straight out of
-    /// its compacted stage.
+    /// [`fragment_matrix_packed`](Tile::fragment_matrix_packed) at a stated storage element `I`
+    /// and physical line `WP`: several logical axes may flatten into one edge, so a contraction
+    /// over taps *and* channels still has a `k` edge, read straight out of a compacted stage.
     pub fn fragment_matrix<I: Numeric, WP: Size, W: Size>(
         &self,
         #[comptime] rows: usize,
         #[comptime] cols: usize,
     ) -> MatrixView<'_, Vector<T, W>> {
-        let vector_size = self.vector_size();
-        match &self.tile_kind {
-            TileKind::Gmem(g) | TileKind::Smem(g) => {
-                let layout = projected_whole_matrix(
-                    comptime!(self.space.clone()),
-                    comptime!(g.projection.clone()),
-                    g.map.clone(),
-                    vector_size,
-                    rows,
-                    cols,
-                );
-                g.matrix_transparent::<I, WP, W, ProjectedMatrix>(layout)
-            }
-            TileKind::PlaneTile(_) | TileKind::PlanePartition(_) => {
-                panic!("Tile::fragment_matrix: a plane tile has no memory view")
-            }
-            TileKind::TmaGmem(_) => {
-                panic!("Tile::fragment_matrix: a tma source has no element view")
-            }
-            TileKind::Procedural(_) | TileKind::Lanes(_) => {
-                panic!(
-                    "Tile::fragment_matrix: a procedural tile and the plane's lanes have no memory view"
-                )
-            }
-        }
+        let g = self.mem("fragment_matrix");
+        let layout = g.whole_matrix(comptime!(self.space.clone()), rows, cols);
+        g.transparent::<I, WP, W, Coords2d, ProjectedMatrix>(layout, comptime!(Guard::Checked))
     }
 }
 

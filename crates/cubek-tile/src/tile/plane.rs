@@ -2,9 +2,8 @@
 //! ([`PlanePartition`]).
 //!
 //! A plane tile is owned by a plane and sliced across its lanes, never unit-addressable: cmma's
-//! `Matrix` is `MatrixScope::Plane`, and manual mma's registers index by `UNIT_POS_PLANE`. The two
-//! are one concept with two encodings ([`CmmaData`], [`MmaData`]), so the partition over them is
-//! encoding-blind and written once. Cube-level MMA is a different scope and does not belong here.
+//! `Matrix` is `MatrixScope::Plane`, manual mma's registers index by `UNIT_POS_PLANE`. One concept,
+//! two encodings ([`CmmaData`], [`MmaData`]), so the partition over them is written once.
 
 use cubecl::{
     cmma::{MatrixIdent, MatrixLayout},
@@ -131,12 +130,13 @@ impl<T: Numeric> PlaneTile<T> {
         }
     }
 
-    /// The tile's `(m, n)`.
+    /// The tile's `(m, n)`, which only a cmma tile carries: the two other encodings size
+    /// themselves off the instruction and never bounce through a scratch.
     pub(crate) fn shape(&self) -> comptime_type!((usize, usize)) {
         match self {
             PlaneTile::Cmma(d) => comptime!(d.shape),
             PlaneTile::Mma(_) | PlaneTile::Register(_) => {
-                panic!("PlaneTile::shape: only a cmma tile bounces through a scratch")
+                panic!("PlaneTile::shape: only a cmma tile states its shape")
             }
         }
     }
@@ -311,6 +311,58 @@ impl<T: Numeric> PlanePartition<T> {
         self.at(0usize, 0usize)
     }
 
+    /// One level down: the `sub_m × sub_n` block of fragments `step` selects, or the one
+    /// fragment where the block is `1 × 1`.
+    ///
+    /// A partition selects under comptime coordinates (an unrolled walk folds regions to
+    /// constants); an uncut level selects the whole partition. A runtime coordinate reaches here
+    /// only from a `Dynamic` (top) level, which cuts nothing on `m`/`n`; a rolled *cut* is refused.
+    pub(crate) fn at_step(&self, step: &Step, #[comptime] space: Space) -> TileKind<T> {
+        let edges = comptime!(MatrixAxes::edges(&space));
+        let a0 = comptime!(space.axis_at(edges.row_split));
+        let a1 = comptime!(space.axis_at(edges.col_split));
+        // A single-tile static axis (k-step, no m/n cut) folds to constant `0`, so a cut axis
+        // takes its constant digit and an uncut one selects the whole partition. A `Dynamic`
+        // axis (top level only) stays runtime, yielding `None`.
+        let mi = if comptime!(step.level.single_static_tile(&space, a0)) {
+            comptime!(Some(0u64))
+        } else {
+            step.coord(a0).constant()
+        };
+        let ni = if comptime!(step.level.single_static_tile(&space, a1)) {
+            comptime!(Some(0u64))
+        } else {
+            step.coord(a1).constant()
+        };
+        match comptime!(mi.zip(ni)) {
+            Some((c0, c1)) => {
+                let (sub_m, sub_n) = comptime!({
+                    let (cm, cn) = (step.level.tiles(&space, a0), step.level.tiles(&space, a1));
+                    assert!(
+                        self.m_tiles.is_multiple_of(cm) && self.n_tiles.is_multiple_of(cn),
+                        "Tile::at: the level's grid must divide the partition"
+                    );
+                    (self.m_tiles / cm, self.n_tiles / cn)
+                });
+                let mi = comptime!(c0 as usize * sub_m);
+                let ni = comptime!(c1 as usize * sub_n);
+                if comptime!(sub_m == 1 && sub_n == 1) {
+                    TileKind::new_PlaneTile(self.at(mi, ni))
+                } else {
+                    TileKind::new_PlanePartition(self.window(mi, ni, sub_m, sub_n))
+                }
+            }
+            None => {
+                comptime!(assert!(
+                    !step.level.cuts_tiles(&space),
+                    "Tile::at: a level that cuts a partition must be walked with compile-time \
+                     coordinates (an unrolled walk)"
+                ));
+                TileKind::new_PlanePartition(self.clone())
+            }
+        }
+    }
+
     /// The `m_tiles × n_tiles` sub-partition at `(mi, ni)` (handle clones, so its tiles are the
     /// parent's): a stacked partition level selects a block where the grid itself selects one.
     pub(crate) fn window(
@@ -342,10 +394,9 @@ impl<T: Numeric> PlanePartition<T> {
     /// `self[r, :] *= corr[r]` over the partition's rows, each tile bounced through the scratch:
     /// stored, scaled a cell per lane, loaded back.
     ///
-    /// The syncs are cube-wide, as every other fragment bounce here is: a plane sync does not
-    /// order a fragment store against the lanes' own writes on every backend. They sit outside
-    /// the skip, so a plane whose factors are all one still reaches each one, and only its work
-    /// is skipped; `corr` is plane-uniform, so that skip is.
+    /// The syncs are cube-wide, as every fragment bounce here is: a plane sync does not order a
+    /// fragment store against the lanes' own writes on every backend. They sit outside the skip,
+    /// so a plane whose factors are all one still reaches each; the skip is uniform, as `corr` is.
     pub(crate) fn rescale_rows(&self, corr: &Array<T>, #[comptime] lanes: usize) {
         let mut scratch = #[comptime]
         match &self.scratch {
@@ -464,11 +515,9 @@ impl<T: Numeric> PlanePartition<T> {
         let a0 = comptime!(window.axis_at(edges.row_split));
         let a1 = comptime!(window.axis_at(edges.col_split));
 
-        // The operand's role is which of the accumulator's axes it shares: `A` spans the rows,
-        // `B` the columns. Its fragments run along that axis, one deep along the contraction —
-        // counted in the window's own axis order, since that is how `at` addresses them.
-        // Of the matrix pair, the contracted axis is the one the accumulator lacks; a split
-        // contraction's other digits stand outside the pair at extent one.
+        // The operand's role is which accumulator axis it shares: `A` the rows, `B` the columns.
+        // Its fragments run along that axis, one deep along the contraction, in the window's own
+        // axis order (how `at` addresses them). The contracted axis is the one `out` lacks.
         let (contracted, free) = comptime!(match (out.contains(a0), out.contains(a1)) {
             (false, true) => (a0, a1),
             (true, false) => (a1, a0),
@@ -499,10 +548,9 @@ impl<T: Numeric> PlanePartition<T> {
         } else {
             (k, rows_along_free)
         });
-        // The role's rows: `A` is `m×k` and `B` is `k×n`, so an operand whose window lists the
-        // axes in that order is row-major, and one listing them the other way — a weight
-        // stored `{n, k}`, read in lines along its contraction — is the same fragment loaded
-        // col-major off the same rows.
+        // The role's rows: `A` is `m×k` and `B` is `k×n`, so a window listing the axes in that
+        // order is row-major, and one listing them the other way (a weight stored `{n, k}`) is the
+        // same fragment loaded col-major off the same rows.
         let layout = comptime!(if (ident == MatrixIdent::A) == (contracted == a1) {
             MatrixLayout::RowMajor
         } else {
@@ -535,11 +583,9 @@ impl<T: Numeric> PlanePartition<T> {
 
     /// This region of an operand, in the form `instruction` reads it.
     ///
-    /// **The one loader a kernel whose instruction is data wants**, and the twin of
-    /// [`Tile::accumulator`](crate::Tile::accumulator). A register block takes its lines out of
-    /// whatever tile it is handed, so the tile *is* the answer and nothing is loaded; the matrix
-    /// forms want their own fragments. A kernel that states its instruction once therefore reads
-    /// its operands the same way whichever form it was given.
+    /// **The one loader a kernel whose instruction is data wants**, twin of
+    /// [`Tile::accumulator`](crate::Tile::accumulator). A register block reads lines out of the
+    /// tile it is handed, so the tile *is* the answer; the matrix forms want their own fragments.
     pub fn operand<Acc: Numeric>(
         src: &Tile<T>,
         acc: &Tile<Acc>,
@@ -624,36 +670,27 @@ impl<T: Numeric> PlanePartition<T> {
     /// Zero every tile.
     pub(crate) fn zero(&self) {
         #[unroll]
-        for mi in 0..comptime!(self.m_tiles) {
-            #[unroll]
-            for ni in 0..comptime!(self.n_tiles) {
-                let mut frag = self.at(mi, ni);
-                frag.zero();
-            }
+        for i in 0..comptime!(self.m_tiles * self.n_tiles) {
+            let mut frag = self.frags.index(i).clone();
+            frag.zero();
         }
     }
 
     /// Initialize every tile with `val`.
     pub(crate) fn init(&self, val: T) {
         #[unroll]
-        for mi in 0..comptime!(self.m_tiles) {
-            #[unroll]
-            for ni in 0..comptime!(self.n_tiles) {
-                let mut frag = self.at(mi, ni);
-                frag.init(val);
-            }
+        for i in 0..comptime!(self.m_tiles * self.n_tiles) {
+            let mut frag = self.frags.index(i).clone();
+            frag.init(val);
         }
     }
 
     /// Multiply every tile by `factor`.
     pub(crate) fn scale(&self, factor: T) {
         #[unroll]
-        for mi in 0..comptime!(self.m_tiles) {
-            #[unroll]
-            for ni in 0..comptime!(self.n_tiles) {
-                let mut frag = self.at(mi, ni);
-                frag.scale(factor);
-            }
+        for i in 0..comptime!(self.m_tiles * self.n_tiles) {
+            let mut frag = self.frags.index(i).clone();
+            frag.scale(factor);
         }
     }
 }
@@ -676,9 +713,8 @@ pub(crate) fn partition_shape(space: &Space, levels: &[Level]) -> (usize, usize)
 }
 
 /// The one level that cuts an operand's window into the partition's grid of fragments on its
-/// trailing two axes, every other axis whole: what a partition fills from, and the kernel never
-/// walks. Stated from the leaf up — one fragment's edges, then how many of them — and held to
-/// the window it fills from.
+/// trailing two axes, every other axis whole: what a partition fills from, never walked. Stated
+/// from the leaf up (one fragment's edges, then how many) and held to the window it fills from.
 fn fragment_level(window: &Space, frag: (usize, usize), tiles: (usize, usize)) -> Level {
     let edges = MatrixAxes::edges(window);
     let (p0, p1) = (edges.row_split, edges.col_split);

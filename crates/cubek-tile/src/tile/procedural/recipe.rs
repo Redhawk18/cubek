@@ -24,8 +24,8 @@ pub trait SeparableRecipeAxisDependencies {
 }
 
 /// The absolute logical coordinates a [`Recipe`] is evaluated at: the source's `origin` plus the
-/// position it is read at, within its [`Space`]. Rebased one axis at a time on demand, so a recipe
-/// emits an add only for the axes it actually reads, and one that ignores its coordinates emits none.
+/// position it is read at, within its [`Space`]. Rebased one axis at a time on demand, so a
+/// recipe emits an add only for the axes it reads, and one that ignores its coordinates emits none.
 #[derive(CubeType, Clone)]
 #[expand(derive(Clone))]
 pub struct RecipeCoords {
@@ -164,6 +164,7 @@ impl<T: Numeric> VirtualRecipe<T> {
     }
 
     /// Whether one separable factor reads `axis` from its recipe coordinates.
+    #[allow(dead_code)] // Reached through its expand, from [`ProceduralData::factor_reads_axis`].
     pub(crate) fn factor_reads_axis(&self, _factor: usize, _axis: Axis) -> comptime_type!(bool) {
         unexpanded!()
     }

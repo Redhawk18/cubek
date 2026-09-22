@@ -22,9 +22,8 @@ pub struct CmmaData<T: Numeric> {
     #[cube(comptime)]
     pub shape: (usize, usize),
     /// This plane's window of shared memory, one tile wide, that the fragment bounces through
-    /// where its intrinsic cannot do the work: a row-wise op, or a drain into a store that folds.
-    /// Opened on the accumulator ([`with_scratch`](Tile::with_scratch)) and carried by every
-    /// fragment taken off it.
+    /// where its intrinsic cannot do the work (a row-wise op, a drain into a folding store). Opened
+    /// on the accumulator ([`with_scratch`](Tile::with_scratch)) and carried by every fragment.
     pub scratch: ComptimeOption<Shared<[T]>>,
     /// Units in one plane, stated with the scratch: what a bounce deals the tile's cells across.
     #[cube(comptime)]
@@ -70,11 +69,6 @@ impl<T: Numeric> CmmaData<T> {
         }
     }
 
-    /// The whole MMA tile's `(m, n)`.
-    pub(crate) fn shape(&self) -> comptime_type!((usize, usize)) {
-        comptime!(self.shape)
-    }
-
     /// Store this tile row-major into `scratch`, one tile's cells from its start.
     pub(crate) fn store_scratch(&self, scratch: &Shared<[T]>) {
         let n = comptime!(self.shape.1 as u32);
@@ -88,8 +82,9 @@ impl<T: Numeric> CmmaData<T> {
         cmma::load_with_layout(&mut self.matrix, scratch, n, MatrixLayout::RowMajor)
     }
 
-    /// An uninitialized fragment presented as a `Cmma` tile. `m`/`n`/`k` are the whole
-    /// MMA tile, passed in full whatever the role.
+    /// An uninitialized fragment presented as a `Cmma` tile, cut by no level: the form a test
+    /// hands the leaf straight. `m`/`n`/`k` are the whole MMA tile, passed in full whatever the
+    /// role.
     pub fn fragment(
         #[comptime] ident: MatrixIdent,
         #[comptime] m: usize,
@@ -98,16 +93,10 @@ impl<T: Numeric> CmmaData<T> {
         #[comptime] layout: MatrixLayout,
         #[comptime] space: Space,
     ) -> Tile<T> {
-        let matrix = unsafe { Matrix::<T>::uninitialized(ident, m, n, k, layout) };
         Tile::<T> {
-            tile_kind: TileKind::new_PlaneTile(PlaneTile::new_Cmma(CmmaData::<T> {
-                matrix,
-                ident,
-                layout,
-                shape: comptime!((m, n)),
-                scratch: ComptimeOption::new_None(),
-                lanes: 0usize,
-            })),
+            tile_kind: TileKind::new_PlaneTile(PlaneTile::new_Cmma(CmmaData::<T>::alloc(
+                ident, m, n, k, layout,
+            ))),
             space: comptime!(space),
             depth: comptime!(0usize),
             levels: comptime!(Vec::new()),
@@ -153,10 +142,6 @@ impl<T: Numeric> CmmaData<T> {
         )
     }
 
-    /// Drain this fragment into a store that folds: bounced through the plane's scratch, then
-    /// each lane adds its cells through the store's own write, which is the atomic add. The
-    /// intrinsic's store replaces and elects no writer; the scratch is what gives each cell one
-    /// owner, so a lane adds it once. The syncs are cube-wide, as every fragment bounce's are.
     /// Store this fragment into its own slot of the plane's scratch: the first half of a bounce,
     /// and the one thing a fragment can do with its cells.
     ///
@@ -167,7 +152,8 @@ impl<T: Numeric> CmmaData<T> {
     }
 
     /// Add this fragment's spilled cells into `mem` through the store's own write, which for a
-    /// folding store is the atomic add: the second half of a bounce.
+    /// folding store is the atomic add: the second half of a bounce. The intrinsic's store
+    /// replaces and elects no writer; the scratch is what gives each cell one owner.
     ///
     /// Lines of the store's width rather than scalars, and the lanes deal them between
     /// themselves, so every cell has exactly one owner and lands once.
