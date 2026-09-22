@@ -21,7 +21,11 @@ impl<EA: Float> Tile<EA> {
     ///
     /// A row lane at any rank: a fold's window on a split-wide tile is
     /// `{1, rows}`, the same cells as a plain `{rows}`.
-    pub fn store_rows(&mut self, values: &Array<EA>, #[comptime] share: RowShare) {
+    ///
+    /// `state` says who owns which rows: its share, and the unit's place in its team, which a
+    /// unit-owned row is numbered from.
+    pub fn store_rows(&mut self, values: &Array<EA>, state: &RowState<EA>) {
+        let share = comptime!(state.share);
         let rpu = comptime!(share.rows());
         let rows = comptime!(self.space.tile_size());
         comptime!(assert!(
@@ -40,7 +44,7 @@ impl<EA: Float> Tile<EA> {
         let writer = owned_lane(share) == 0;
         #[unroll]
         for ri in 0..rpu {
-            let r = owned_row(share, ri);
+            let r = state.owned_row(ri);
             if r < rows && writer {
                 view.write(r, Vector::cast_from(values[ri]));
             }
@@ -54,9 +58,12 @@ impl<EA: Float> Tile<EA> {
     /// A plane-resident accumulator ([`cmma_accumulator`](Tile::cmma_accumulator)) is scaled
     /// where it sits, tile by tile through its scratch ([`with_scratch`](Tile::with_scratch)); the
     /// owner is the plane, so `share` is its plane share and the rows are the accumulator's own.
-    pub fn rescale_rows(&mut self, corr: &Array<EA>, #[comptime] share: RowShare) {
+    ///
+    /// `state` as [`store_rows`](Tile::store_rows) takes it.
+    pub fn rescale_rows(&mut self, corr: &Array<EA>, state: &RowState<EA>) {
+        let share = comptime!(state.share);
         match &self.tile_kind {
-            TileKind::Gmem(_) | TileKind::Smem(_) => self.rescale_rows_in_memory(corr, share),
+            TileKind::Gmem(_) | TileKind::Smem(_) => self.rescale_rows_in_memory(corr, state),
             TileKind::PlanePartition(p) => {
                 let lanes = comptime!(match share {
                     RowShare::Plane { rows: _, lanes } => lanes,
@@ -75,7 +82,8 @@ impl<EA: Float> Tile<EA> {
         }
     }
 
-    fn rescale_rows_in_memory(&mut self, corr: &Array<EA>, #[comptime] share: RowShare) {
+    fn rescale_rows_in_memory(&mut self, corr: &Array<EA>, state: &RowState<EA>) {
+        let share = comptime!(state.share);
         let rank = comptime!(self.space.rank());
         let rows = comptime!(self.space.extent_at(rank - 2));
         let cols = comptime!(self.space.extent_at(rank - 1));
@@ -88,7 +96,7 @@ impl<EA: Float> Tile<EA> {
         let mut view = self.flat_mut::<W>();
         #[unroll]
         for ri in 0..rpw {
-            let r = owned_row(share, ri);
+            let r = state.owned_row(ri);
             if r < rows {
                 let factor = Vector::<EA, W>::cast_from(corr[ri]);
                 #[unroll]
@@ -136,7 +144,8 @@ impl<EA: Float> Tile<EA> {
 
     /// Cast-copy the owned rows into `dest`, which is laid out in the same
     /// lines.
-    pub(crate) fn write_rows_to<EP: Numeric>(&self, dest: &mut Tile<EP>, #[comptime] rpu: usize) {
+    pub(crate) fn write_rows_to<EP: Numeric>(&self, dest: &mut Tile<EP>, state: &RowState<EA>) {
+        let rpu = comptime!(state.share.rows());
         let rows = comptime!(self.space.extent_at(0));
         let cols = comptime!(self.space.extent_at(1));
         let w = self.vector_size();
@@ -152,7 +161,7 @@ impl<EA: Float> Tile<EA> {
 
         #[unroll]
         for ri in 0..rpu {
-            let r = UNIT_POS_X as usize * rpu + ri;
+            let r = state.owned_row(ri);
             if r < rows {
                 #[unroll]
                 for line in 0..lines {

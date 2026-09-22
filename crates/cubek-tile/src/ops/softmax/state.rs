@@ -55,19 +55,6 @@ impl RowShare {
     }
 }
 
-/// The row of the tile this worker's `ri`-th owned row is: the ownership rule, stated once.
-///
-/// A unit owns a run of `rows` rows of the tile it is handed, `rows` per unit along the cube's
-/// x dim. A plane owns every row of the tile it is handed: the kernel windows the tile per plane
-/// before the call, so no leaf indexes planes.
-#[cube]
-pub fn owned_row(#[comptime] share: RowShare, ri: usize) -> usize {
-    match comptime!(share) {
-        RowShare::Unit { rows } => UNIT_POS_X as usize * rows + ri,
-        RowShare::Plane { rows: _, lanes: _ } => ri,
-    }
-}
-
 /// This unit's lane within its worker: its position in the plane, or zero for a unit.
 #[cube]
 pub fn owned_lane(#[comptime] share: RowShare) -> usize {
@@ -92,6 +79,9 @@ pub struct RowState<E: Float> {
     /// holds the same `(m, l)`, since a plane-reduced score is plane-uniform.
     #[cube(comptime)]
     pub share: RowShare,
+    /// This unit's place in the team sharing the tile, which a unit-owned row is numbered from
+    /// ([`owned_row`](RowState::owned_row)). Unread under [`RowShare::Plane`].
+    pub team: TeamUnit,
 }
 
 /// What one streamed [`absorb`](RowState::absorb) tells the row's
@@ -129,8 +119,19 @@ impl<E: Float> RowState<E> {
         RowState::<E>::of(space, comptime!(RowShare::Plane { rows, lanes }))
     }
 
-    /// The state one worker holds, at whatever [`RowShare`] the caller states.
+    /// The state one worker holds, at whatever [`RowShare`] the caller states, its team laid
+    /// along the cube's x dim ([`TeamUnit::along_x`]).
     pub fn of(#[comptime] space: Space, #[comptime] share: RowShare) -> RowState<E> {
+        RowState::<E>::in_team(space, share, &TeamUnit::along_x())
+    }
+
+    /// [`of`](RowState::of) for a worker whose place in its team the caller states — what a
+    /// kernel whose levels deal the team reads off them.
+    pub fn in_team(
+        #[comptime] space: Space,
+        #[comptime] share: RowShare,
+        team: &TeamUnit,
+    ) -> RowState<E> {
         let rows = comptime!(share.rows());
         let mut m = Array::new(rows);
         let mut l = Array::new(rows);
@@ -138,7 +139,25 @@ impl<E: Float> RowState<E> {
             m[i] = E::min_value();
             l[i] = E::from_int(0);
         }
-        RowState::<E> { m, l, space, share }
+        RowState::<E> {
+            m,
+            l,
+            space,
+            share,
+            team: team.clone(),
+        }
+    }
+
+    /// The row of the tile this worker's `ri`-th owned row is: the ownership rule, stated once.
+    ///
+    /// A unit owns a run of `rows` rows of the tile it is handed, `rows` per unit of its team,
+    /// the unit at `index` starting at `index * rows`. A plane owns every row of the tile it is
+    /// handed: the kernel windows the tile per plane before the call, so no leaf indexes planes.
+    pub fn owned_row(&self, ri: usize) -> usize {
+        match comptime!(self.share) {
+            RowShare::Unit { rows } => self.team.index * rows + ri,
+            RowShare::Plane { rows: _, lanes: _ } => ri,
+        }
     }
 
     /// Absorb one block's row maxes and sums: `m = max_buf`,
