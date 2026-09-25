@@ -900,10 +900,15 @@ impl<T: Numeric> MemData<T> {
         match comptime!(self.access.storage) {
             Storage::Strided => {}
             Storage::Contiguous => {}
-            Storage::Tiled(level) => panic!(
+            Storage::Tiled(Some(level)) => panic!(
                 "MemData::window_offset: this window sits above its storage tile (the tile of \
                  level {level}), spanning several, so it is not one contiguous region; descend \
                  through that level first, or read the operand through its layout"
+            ),
+            Storage::Tiled(None) => panic!(
+                "MemData::window_offset: this operand's storage tile is the tile of no level of \
+                 the kernel's nest, so no window is known to lie inside one; read it through its \
+                 layout, or stage it"
             ),
         }
         // A raw window serves the buffer at the element it was erased to, so a quantized store
@@ -1612,7 +1617,8 @@ fn storage_below(storage: Storage, depth: usize, level: &Level, space: &Space) -
     match storage {
         Storage::Strided => Storage::Strided,
         Storage::Contiguous => Storage::Contiguous,
-        Storage::Tiled(tiled_at) => {
+        Storage::Tiled(None) => Storage::Tiled(None),
+        Storage::Tiled(Some(tiled_at)) => {
             assert!(
                 depth <= tiled_at,
                 "MemData::at: this window is above its storage tile, the tile of level \
@@ -1620,7 +1626,7 @@ fn storage_below(storage: Storage, depth: usize, level: &Level, space: &Space) -
                  skipped past"
             );
             if depth < tiled_at {
-                return Storage::Tiled(tiled_at);
+                return Storage::Tiled(Some(tiled_at));
             }
             for axis in space.axes() {
                 assert!(
