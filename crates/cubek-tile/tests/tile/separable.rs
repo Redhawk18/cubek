@@ -6,18 +6,20 @@
 //! checked against the general one as well as against the host.
 #![allow(non_snake_case)]
 
+use super::{Form, implied};
 use cubecl::{features::TypeUsage, ir::ElemType, prelude::*, zspace::shape};
 use cubek_quant::scheme::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 use cubek_test_utils::{
     HostData, HostDataType, TestInput, TestOutcome, TileInput, ValidationResult,
 };
 use cubek_tile::*;
+use cubek_tile::{Boundary, BoundaryPolicy, Quantization};
 
 const ROW: Axis = Axis(0);
 const COL: Axis = Axis(1);
 const TAP: [Axis; 3] = [Axis(2), Axis(3), Axis(4)];
 
-/// The software instruction every leaf here runs under: a 16-cell budget, no edge split, no lane
+/// The software instruction every leaf here runs under: a 16-cell budget, no edge split, no unit
 /// fan-out.
 const REGISTER_BLOCK: RegisterBlock = RegisterBlock::new(16);
 
@@ -33,10 +35,10 @@ const OFFSET: [f32; 3] = [1.0, 2.0, 3.0];
 const COEFFICIENT: [f32; 3] = [1.0, 3.0, 5.0];
 const ROW_COEFFICIENT: [f32; 3] = [2.0, 0.0, 0.0];
 
-/// Every factor is the same type, which is what a [`SeparableProduct`] holds: one filter family
+/// Every factor is the same type, which is what a [`Factors`] holds: one filter family
 /// applied along each axis, at that axis's own coordinates.
 type Factor<E> = Sum<AffineCoordinate<E>, AffineCoordinate<E>>;
-type Weights<E> = SeparableProduct<Factor<E>>;
+type Weights<E> = Factors<Factor<E>>;
 
 fn factor_value(f: usize, tap: usize, row: usize) -> f32 {
     OFFSET[f] + COEFFICIENT[f] * tap as f32 + ROW_COEFFICIENT[f] * row as f32
@@ -61,7 +63,7 @@ fn weights<E: Float>() -> Weights<E> {
     for f in 0..comptime!(TAP.len()) {
         factors.push(factor::<E>(f));
     }
-    separable_product(factors)
+    Factors::new(factors)
 }
 
 #[cube(launch)]
@@ -76,12 +78,17 @@ fn separable_kernel<E: Float>(
     let input = input.tile(comptime!(space.clone()));
     let weight_axes = comptime!([&[ROW], TAP.as_slice()].concat());
     let weights = if comptime!(separable) {
-        Tile::<E>::procedural_separable::<Weights<E>>(
-            comptime!(space.project(&weight_axes)),
+        Procedural::<E>::separable::<Weights<E>>(
+            comptime!(space.space().subspace(&weight_axes)),
             weights::<E>(),
         )
+        .tile()
     } else {
-        Tile::<E>::procedural::<Weights<E>>(comptime!(space.project(&weight_axes)), weights::<E>())
+        Procedural::<E>::new::<Weights<E>>(
+            comptime!(space.space().subspace(&weight_axes)),
+            weights::<E>(),
+        )
+        .tile()
     };
 
     let output = output.tile(comptime!(space.clone()));
@@ -109,15 +116,16 @@ fn separable_kernel_staged<E: Float>(
 ) {
     let input = input.tile(comptime!(space.clone()));
     let weight_axes = comptime!([&[ROW], TAP.as_slice()].concat());
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&weight_axes)),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&weight_axes)),
         weights::<E>(),
-    );
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     let walk = space.over(&level);
-    let mut ring = Ring::smem_single_at(&walk, &input, StageStorage::Strided, width, 1usize);
-    pipelined(walk, &mut ring, |slot, region| {
+    let mut stages = Stages::smem_single_at(&walk, &input, StageStorage::Strided, width, 1usize);
+    stages.pipelined(walk, |slot, region| {
         let mut out = output.at(region);
         let weights = weights.at(region);
         slot.consume(|input| {
@@ -168,7 +176,7 @@ fn run(separable: bool) -> (HostData, Vec<f32>) {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -178,7 +186,7 @@ fn run(separable: bool) -> (HostData, Vec<f32>) {
                 (TAP[1], TAPS[1]),
                 (TAP[2], TAPS[2]),
             ]),
-            Tiling::leaf(&[
+            Levels::leaf(&[
                 (ROW, ROWS),
                 (COL, COLS),
                 (TAP[0], TAPS[0]),
@@ -186,9 +194,9 @@ fn run(separable: bool) -> (HostData, Vec<f32>) {
                 (TAP[2], TAPS[2]),
             ])
             .walk_every(&[ROW, COL, TAP[0], TAP[1], TAP[2]])
-            .levels(),
+            .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     separable_kernel::launch(
@@ -205,7 +213,7 @@ fn run(separable: bool) -> (HostData, Vec<f32>) {
         ),
         separable,
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -260,7 +268,7 @@ fn a_separable_lhs_contracts_a_padded_staged_rhs() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -270,7 +278,7 @@ fn a_separable_lhs_contracts_a_padded_staged_rhs() {
                 (TAP[1], TAPS[1]),
                 (TAP[2], TAPS[2]),
             ]),
-            Tiling::leaf(&[
+            Levels::leaf(&[
                 (ROW, ROWS),
                 (COL, COLS),
                 (TAP[0], TAPS[0]),
@@ -278,9 +286,9 @@ fn a_separable_lhs_contracts_a_padded_staged_rhs() {
                 (TAP[2], TAPS[2]),
             ])
             .walk_every(&[ROW, COL, TAP[0], TAP[1], TAP[2]])
-            .levels(),
+            .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::direct(&[TAP[0], TAP[1], TAP[2], COL]);
@@ -296,7 +304,7 @@ fn a_separable_lhs_contracts_a_padded_staged_rhs() {
         ),
         Some(4),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -334,10 +342,11 @@ fn separable_quant_kernel<E: Float, I: Numeric, VI: Size, V: Size>(
 ) {
     let input = input.tile::<E>(comptime!(space.clone()));
     let weight_axes = comptime!([&[ROW], TAP.as_slice()].concat());
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&weight_axes)),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&weight_axes)),
         weights::<E>(),
-    );
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -390,7 +399,7 @@ fn a_separable_lhs_contracts_a_native_quantized_rhs() {
         .custom(vec![QSCALE])
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -400,7 +409,7 @@ fn a_separable_lhs_contracts_a_native_quantized_rhs() {
                 (TAP[1], TAPS[1]),
                 (TAP[2], TAPS[2]),
             ]),
-            Tiling::leaf(&[
+            Levels::leaf(&[
                 (ROW, ROWS),
                 (COL, QCOLS),
                 (TAP[0], TAPS[0]),
@@ -408,16 +417,21 @@ fn a_separable_lhs_contracts_a_native_quantized_rhs() {
                 (TAP[2], TAPS[2]),
             ])
             .walk_every(&[ROW, COL, TAP[0], TAP[1], TAP[2]])
-            .levels(),
+            .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let input_op = launcher
         .arg(in_handle.binding())
-        .subspace(&[TAP[0], TAP[1], TAP[2], COL])
+        .axes(&[TAP[0], TAP[1], TAP[2], COL])
         .vectorize(QV)
-        .quantized(&[scales.binding()], scheme, DequantAt::Read)
+        .quantized(Quantization::new(
+            scales.binding(),
+            None,
+            scheme,
+            DequantAt::Read,
+        ))
         .build();
 
     let f32_ty = f32::elem_type_native();
@@ -432,13 +446,13 @@ fn a_separable_lhs_contracts_a_native_quantized_rhs() {
         launcher.cube_dim(),
         input_op.bound_width(),
         QV,
-        input_op.arg(),
+        input_op.quant_arg(),
         TileArgLaunch::new(
             out_handle.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         in_dtype,
         f32_ty,
     );
@@ -487,7 +501,7 @@ fn a_separable_lhs_contracts_a_packed_quantized_rhs() {
         return;
     }
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -497,7 +511,7 @@ fn a_separable_lhs_contracts_a_packed_quantized_rhs() {
                 (TAP[1], TAPS[1]),
                 (TAP[2], TAPS[2]),
             ]),
-            Tiling::leaf(&[
+            Levels::leaf(&[
                 (ROW, ROWS),
                 (COL, pack),
                 (TAP[0], TAPS[0]),
@@ -505,14 +519,14 @@ fn a_separable_lhs_contracts_a_packed_quantized_rhs() {
                 (TAP[2], TAPS[2]),
             ])
             .walk_every(&[ROW, COL, TAP[0], TAP[1], TAP[2]])
-            .levels(),
+            .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let input = TileInput::builder(
         &client,
-        launcher.space().project(&[TAP[0], TAP[1], TAP[2], COL]),
+        launcher.space().subspace(&[TAP[0], TAP[1], TAP[2], COL]),
     )
     .untiled()
     .packed(&scheme, DequantAt::Read)
@@ -526,9 +540,14 @@ fn a_separable_lhs_contracts_a_packed_quantized_rhs() {
 
     let input_op = launcher
         .arg(input.tile.handle().binding())
-        .subspace(&[TAP[0], TAP[1], TAP[2], COL])
+        .axes(&[TAP[0], TAP[1], TAP[2], COL])
         .vectorize(pack)
-        .quantized(&[input.scales_binding()], scheme, DequantAt::Read)
+        .quantized(Quantization::new(
+            input.scales_binding(),
+            None,
+            scheme,
+            DequantAt::Read,
+        ))
         .build();
 
     separable_quant_kernel::launch(
@@ -537,13 +556,13 @@ fn a_separable_lhs_contracts_a_packed_quantized_rhs() {
         launcher.cube_dim(),
         input_op.bound_width(),
         pack,
-        input_op.arg(),
+        input_op.quant_arg(),
         TileArgLaunch::new(
             out_handle.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         u32::elem_type_native(),
         f32_ty,
     );
@@ -597,7 +616,7 @@ fn resample_origin(row: usize) -> usize {
 fn resample_weights<E: Float>() -> Weights<E> {
     let mut factors = Sequence::new();
     factors.push(factor::<E>(0usize));
-    separable_product(factors)
+    Factors::new(factors)
 }
 
 #[cube(launch)]
@@ -610,15 +629,16 @@ fn resample_kernel<E: Float>(
     #[define(E)] _dtype: ElemType,
 ) {
     let input = input.tile(comptime!(space.clone()));
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&[ROW, TAP[0]])),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&[ROW, TAP[0]])),
         resample_weights::<E>(),
     );
     let weights = if comptime!(normalized) {
-        weights.normalized(comptime!(TapMask::Unmasked), comptime!(DivGuard::default()))
+        weights.normalized(comptime!(TapSupport::Whole), comptime!(DivGuard::default()))
     } else {
         weights
-    };
+    }
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -658,15 +678,15 @@ fn check_resampling(normalized: bool) {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)]),
-            Tiling::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
+            Levels::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::new(Projection::new(
@@ -688,7 +708,7 @@ fn check_resampling(normalized: bool) {
         ),
         normalized,
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -716,7 +736,7 @@ fn check_resampling(normalized: bool) {
 // ---- masked normalization against a procedural trailing tile ----------------
 
 /// Normalize one deliberately child-local factor run at a time. This shape makes the rhs's
-/// second procedural window contain one real tap and one padded tap, so `TapMask::Masked` must
+/// second procedural window contain one real tap and one padded tap, so `TapSupport::InBounds` must
 /// distinguish the checked-read zero from an in-bounds sample without relying on backing memory.
 #[cube(launch)]
 fn procedural_mask_kernel<E: Float>(
@@ -725,10 +745,11 @@ fn procedural_mask_kernel<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let rhs = Tile::<E>::procedural::<AffineCoordinate<E>>(
-        comptime!(space.project(&[TAP[0], COL])),
+    let rhs = Procedural::<E>::new::<AffineCoordinate<E>>(
+        comptime!(space.space().subspace(&[TAP[0], COL])),
         affine_along(TAP[0], E::new(1.0_f32), E::new(1.0_f32)),
-    );
+    )
+    .tile();
     let mut output = output.tile(comptime!(space.clone()));
     output.zero();
 
@@ -737,11 +758,15 @@ fn procedural_mask_kernel<E: Float>(
         let child = comptime!(level.clone().child(&space.space().clone()));
         let mut factors = Sequence::new();
         factors.push(affine_along(TAP[0], E::new(1.0_f32), E::new(0.0_f32)));
-        let weights = Tile::<E>::procedural_separable::<SeparableProduct<AffineCoordinate<E>>>(
-            comptime!(child.project(&[ROW, TAP[0]])),
-            separable_product(factors),
+        let weights = Procedural::<E>::separable::<Factors<AffineCoordinate<E>>>(
+            comptime!(child.subspace(&[ROW, TAP[0]])),
+            Factors::new(factors),
         )
-        .normalized(comptime!(TapMask::Masked), comptime!(DivGuard::default()));
+        .normalized(
+            comptime!(TapSupport::InBounds),
+            comptime!(DivGuard::default()),
+        )
+        .tile();
         output
             .at(&region)
             .mma_with(&weights, &rhs, REGISTER_BLOCK, Semiring::SUM_PROD);
@@ -756,15 +781,15 @@ fn masked_normalization_excludes_a_procedural_overhang() {
         .dtype(dtype)
         .zeros()
         .generate_without_host_data();
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, 1), (COL, 1), (TAP[0], 3)]),
-            Tiling::leaf(&[(ROW, 1), (COL, 1), (TAP[0], 2)])
+            Levels::leaf(&[(ROW, 1), (COL, 1), (TAP[0], 2)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     procedural_mask_kernel::launch(
@@ -776,12 +801,12 @@ fn masked_normalization_excludes_a_procedural_overhang() {
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
     let got = HostData::from_tensor_handle(&client, output, HostDataType::F32).get_f32(&[0, 0]);
-    // Mechanism assertion: tests that `TapMask::Masked` excludes the overhang tap across chunks.
+    // Mechanism assertion: tests that `TapSupport::InBounds` excludes the overhang tap across chunks.
     // First chunk: (1 + 2) / 2. Trailing chunk: 3 / 1 (with its padded fourth tap excluded).
     // Sum across chunks yields 1.5 + 3.0 = 4.5.
     assert!((got - 4.5).abs() < 1.0e-6, "got {got}, want 4.5");
@@ -798,11 +823,15 @@ fn resample_kernel_masked<E: Float>(
     #[define(E)] _dtype: ElemType,
 ) {
     let input = input.tile(comptime!(space.clone()));
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&[ROW, TAP[0]])),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&[ROW, TAP[0]])),
         resample_weights::<E>(),
     )
-    .normalized(comptime!(TapMask::Masked), comptime!(DivGuard::default()));
+    .normalized(
+        comptime!(TapSupport::InBounds),
+        comptime!(DivGuard::default()),
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -827,16 +856,20 @@ fn resample_kernel_masked_staged<E: Float>(
     #[define(E)] _dtype: ElemType,
 ) {
     let input = input.tile(comptime!(space.clone()));
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&[ROW, TAP[0]])),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&[ROW, TAP[0]])),
         resample_weights::<E>(),
     )
-    .normalized(comptime!(TapMask::Masked), comptime!(DivGuard::default()));
+    .normalized(
+        comptime!(TapSupport::InBounds),
+        comptime!(DivGuard::default()),
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     let walk = space.over(&level);
-    let mut ring = Ring::smem_single(&walk, &input, StageStorage::Strided, 1usize);
-    pipelined(walk, &mut ring, |slot, region| {
+    let mut stages = Stages::smem_single(&walk, &input, StageStorage::Strided, 1usize);
+    stages.pipelined(walk, |slot, region| {
         let mut out = output.at(region);
         let weights = weights.at(region);
         slot.consume(|input| {
@@ -863,15 +896,15 @@ fn masked_normalization_dedarkens_a_boundary_zero_gmem_input() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)]),
-            Tiling::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
+            Levels::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::new(Projection::new(
@@ -881,7 +914,7 @@ fn masked_normalization_dedarkens_a_boundary_zero_gmem_input() {
             PhysicalAxisMap::of(COL),
         ],
     ))
-    .checked(true);
+    .boundary(BoundaryPolicy::Every(Boundary::Zero));
 
     resample_kernel_masked::launch(
         &client,
@@ -893,7 +926,7 @@ fn masked_normalization_dedarkens_a_boundary_zero_gmem_input() {
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -922,7 +955,7 @@ fn masked_normalization_dedarkens_a_boundary_zero_gmem_input() {
 
 /// The staged twin of [`masked_normalization_dedarkens_a_boundary_zero_gmem_input`].
 ///
-/// `TapMask::Masked` has to drop the taps that overhang the input, but the fill has already
+/// `TapSupport::InBounds` has to drop the taps that overhang the input, but the fill has already
 /// replaced those with zeros by the time the leaf reads them: a staged window cannot tell a padded
 /// zero from a real sample, so the stage records its source window and masks to that rectangle.
 ///
@@ -946,15 +979,15 @@ fn masked_normalization_dedarkens_a_boundary_zero_smem_input() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)]),
-            Tiling::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
+            Levels::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::new(Projection::new(
@@ -964,7 +997,7 @@ fn masked_normalization_dedarkens_a_boundary_zero_smem_input() {
             PhysicalAxisMap::of(COL),
         ],
     ))
-    .checked(true);
+    .boundary(BoundaryPolicy::Every(Boundary::Zero));
 
     resample_kernel_masked_staged::launch(
         &client,
@@ -976,7 +1009,7 @@ fn masked_normalization_dedarkens_a_boundary_zero_smem_input() {
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -1023,11 +1056,12 @@ fn column_spanning_resample_kernel<E: Float>(
     #[define(E)] _dtype: ElemType,
 ) {
     let input = input.tile(comptime!(space.clone()));
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&[ROW, COL, TAP[0]])),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&[ROW, COL, TAP[0]])),
         resample_weights::<E>(),
     )
-    .normalized(comptime!(TapMask::Unmasked), comptime!(DivGuard::default()));
+    .normalized(comptime!(TapSupport::Whole), comptime!(DivGuard::default()))
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -1060,15 +1094,15 @@ fn a_column_spanning_separable_lhs_normalizes_its_factor_run() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)]),
-            Tiling::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
+            Levels::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::new(Projection::new(
@@ -1089,7 +1123,7 @@ fn a_column_spanning_separable_lhs_normalizes_its_factor_run() {
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -1120,11 +1154,15 @@ fn column_spanning_resample_kernel_masked<E: Float>(
     #[define(E)] _dtype: ElemType,
 ) {
     let input = input.tile(comptime!(space.clone()));
-    let weights = Tile::<E>::procedural_separable::<Weights<E>>(
-        comptime!(space.project(&[ROW, COL, TAP[0]])),
+    let weights = Procedural::<E>::separable::<Weights<E>>(
+        comptime!(space.space().subspace(&[ROW, COL, TAP[0]])),
         resample_weights::<E>(),
     )
-    .normalized(comptime!(TapMask::Masked), comptime!(DivGuard::default()));
+    .normalized(
+        comptime!(TapSupport::InBounds),
+        comptime!(DivGuard::default()),
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -1156,15 +1194,15 @@ fn a_column_spanning_separable_lhs_masks_and_dedarkens_boundary_zero_gmem_input(
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)]),
-            Tiling::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
+            Levels::leaf(&[(ROW, RROWS), (COL, RCOLS), (TAP[0], RTAPS)])
                 .walk_every(&[ROW, COL, TAP[0]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let in_spec = TileSpec::new(Projection::new(
@@ -1174,7 +1212,7 @@ fn a_column_spanning_separable_lhs_masks_and_dedarkens_boundary_zero_gmem_input(
             PhysicalAxisMap::of(COL),
         ],
     ))
-    .checked(true);
+    .boundary(BoundaryPolicy::Every(Boundary::Zero));
 
     column_spanning_resample_kernel_masked::launch(
         &client,
@@ -1186,7 +1224,7 @@ fn a_column_spanning_separable_lhs_masks_and_dedarkens_boundary_zero_gmem_input(
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 
@@ -1229,17 +1267,18 @@ fn zero_sum_fallback_kernel<E: Float>(
     factors.push(affine_along(TAP[0], E::new(1.0_f32), E::new(-2.0_f32)));
     // Factor 1: taps at k=0 (2.0) and k=1 (2.0), sum = 4.0
     factors.push(affine_along(TAP[1], E::new(2.0_f32), E::new(0.0_f32)));
-    let weights = Tile::<E>::procedural_separable::<SeparableProduct<AffineCoordinate<E>>>(
-        comptime!(space.project(&[ROW, TAP[0], TAP[1]])),
-        separable_product(factors),
+    let weights = Procedural::<E>::separable::<Factors<AffineCoordinate<E>>>(
+        comptime!(space.space().subspace(&[ROW, TAP[0], TAP[1]])),
+        Factors::new(factors),
     )
     .normalized(
-        comptime!(TapMask::Unmasked),
+        comptime!(TapSupport::Whole),
         comptime!(DivGuard {
             epsilon: 1.0e-7,
             fallback: 3.0,
         }),
-    );
+    )
+    .tile();
 
     let output = output.tile(comptime!(space.clone()));
     for region in space.over(&level) {
@@ -1269,15 +1308,15 @@ fn a_zero_factor_sum_takes_fallback_without_poisoning_siblings() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, 1), (COL, 1), (TAP[0], 2), (TAP[1], 2)]),
-            Tiling::leaf(&[(ROW, 1), (COL, 1), (TAP[0], 2), (TAP[1], 2)])
+            Levels::leaf(&[(ROW, 1), (COL, 1), (TAP[0], 2), (TAP[1], 2)])
                 .walk_every(&[ROW, COL, TAP[0], TAP[1]])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     zero_sum_fallback_kernel::launch(
@@ -1293,7 +1332,7 @@ fn a_zero_factor_sum_takes_fallback_without_poisoning_siblings() {
             TileSpec::direct(&[ROW, COL]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         f32_ty,
     );
 

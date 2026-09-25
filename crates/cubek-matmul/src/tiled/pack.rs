@@ -14,9 +14,7 @@ use cubecl::{
     std::tensor::{TensorHandle, layout::CoordsDyn},
     zspace::{Shape, Tiling},
 };
-use cubek_tile::{
-    Axis, Geometry, KernelForm, Launcher, Level, Partitioning, Space, TileArg, Tiling as Levels,
-};
+use cubek_tile::{Axis, Geometry, Grid, Launcher, Level, Levels, Partitioning, Space, TileArg};
 
 use crate::{
     definition::MatmulSetupError,
@@ -40,7 +38,7 @@ fn relayout<E: Numeric, V: Size>(
 ) {
     let src = src.tile(comptime!(space.clone()));
     let dst = dst.tile(comptime!(space.clone()));
-    let rank = comptime!(space.rank());
+    let rank = comptime!(space.space().rank());
     let ri = comptime!(rank - 2);
     let ci = comptime!(rank - 1);
     for cube in space.over(&level) {
@@ -229,17 +227,25 @@ fn relayout_launch(
     let level = Levels::leaf(&[(M, tr), (N, tc)])
         .cubes(&[M, N])
         .batches(&batch_axes)
-        .levels()
+        .build()
         .remove(0);
     let partitioning = Partitioning::new(space, vec![level.clone()]);
     let cube_count = partitioning.cube_count();
     let cube_dim = CubeDim::new_1d(client.properties().hardware.plane_size_max);
-    let launch = Launcher::partitioned(
-        client,
-        partitioning,
-        (cube_count.clone(), cube_dim),
-        KernelForm::Dynamic,
-    );
+    let launch = {
+        let partitioning = partitioning;
+        let concrete = partitioning.space().clone();
+        let (cube_count, cube_dim) = (cube_count.clone(), cube_dim);
+        Launcher::new(
+            client,
+            partitioning.all_dynamic(),
+            &concrete,
+            Grid::Stated {
+                cube_count,
+                cube_dim,
+            },
+        )
+    };
     let v = launch.vector_size(
         N,
         &[
@@ -250,13 +256,13 @@ fn relayout_launch(
     );
     let s = launch
         .arg(src)
-        .subspace(&[M, N])
+        .axes(&[M, N])
         .batches(&all_batch_axes)
         .vectorize(v)
         .build();
     let d = launch
         .arg(dst)
-        .subspace(&[M, N])
+        .axes(&[M, N])
         .batches(&all_batch_axes)
         .vectorize(v)
         .build();

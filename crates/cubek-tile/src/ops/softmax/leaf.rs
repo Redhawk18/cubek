@@ -4,7 +4,7 @@
 //! Row ownership is the state's statement ([`RowShare`]) and this leaf's only branch: a worker
 //! owns a contiguous slice of the score tile's rows and keeps their running state in registers.
 //!
-//! The worker is a unit ([`rowwise`](super::rowwise)) or a plane whose lanes split the reduced
+//! The worker is a unit ([`rowwise`](super::rowwise)) or a plane whose units split the reduced
 //! axis ([`planewise`](super::planewise)); neither arm reads another worker's cell, so no syncs.
 
 use cubecl::prelude::*;
@@ -34,7 +34,7 @@ impl<EA: Float> Tile<EA> {
         let corr = self.softmax_in_place(state, probe, mask, scale);
         match comptime!(state.share) {
             RowShare::Unit { rows: _ } => self.write_rows_to(p, &*state),
-            RowShare::Plane { rows, lanes } => self.write_rows_to_planar(p, rows, lanes),
+            RowShare::Plane { rows, units } => self.write_rows_to_planar(p, rows, units),
         }
         corr
     }
@@ -49,7 +49,7 @@ impl<EA: Float> Tile<EA> {
         mask: &Tile<u32>,
         scale: EA,
     ) -> Array<EA> {
-        let rank = comptime!(self.space.rank());
+        let rank = comptime!(self.place.space.rank());
         // Rank, not finality: a score tile states the instruction its matmuls contract through,
         // and that statement is a level. Every read here is a flat one over the whole tile, which
         // is the same cells whatever cuts them.
@@ -58,15 +58,15 @@ impl<EA: Float> Tile<EA> {
             "softmax: a leaf op on rank-2 score tiles"
         ));
         comptime!(assert!(
-            state.space.contains(self.space.axis_at(0))
-                && !state.space.contains(self.space.axis_at(1)),
+            state.space.contains(self.place.space.axis_at(0))
+                && !state.space.contains(self.place.space.axis_at(1)),
             "softmax reduces the score axis absent from the state's space; \
              v1 requires it to be the trailing axis"
         ));
         // The passes read a row a line at a time, so the lines must not straddle rows.
         let w = self.vector_size();
         comptime!(assert!(
-            self.space.extent_at(1).is_multiple_of(w),
+            self.place.space.extent_at(1).is_multiple_of(w),
             "softmax: the score's line width divides its columns"
         ));
 
@@ -81,11 +81,11 @@ impl<EA: Float> Tile<EA> {
                 self.exp_diff(&max_buf, &*state);
                 self.row_sum(&mut sum_buf, &*state);
             }
-            RowShare::Plane { rows, lanes } => {
-                self.scale_and_mask_planar(scale, probe, mask, rows, lanes);
-                self.row_max_planar(&mut max_buf, &state.m, rows, lanes);
-                self.exp_diff_planar(&max_buf, rows, lanes);
-                self.row_sum_planar(&mut sum_buf, rows, lanes);
+            RowShare::Plane { rows, units } => {
+                self.scale_and_mask_planar(scale, probe, mask, rows, units);
+                self.row_max_planar(&mut max_buf, &state.m, rows, units);
+                self.exp_diff_planar(&max_buf, rows, units);
+                self.row_sum_planar(&mut sum_buf, rows, units);
             }
         }
 

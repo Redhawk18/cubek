@@ -26,6 +26,7 @@ use cubecl::{
 };
 use cubek_test_utils::{HostData, HostDataType, TestInput, TestOutcome, ValidationResult};
 
+use super::{Form, implied};
 use cubek_tile::*;
 
 const M: Axis = Axis(0);
@@ -109,13 +110,13 @@ fn run_split_k(m: usize, n: usize, k: usize, splits: usize) -> (HostData, HostDa
         .generate_without_host_data();
 
     // One split per cube, the whole output tile in each: the split is the only thing on the grid.
-    let split_space = Launcher::implied(
+    let split_space = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (KB, splits), (KI, inside)]),
-            Tiling::leaf(&[(KB, 1)]).cubes(&[KB]).levels(),
+            Levels::leaf(&[(KB, 1)]).cubes(&[KB]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     // `a` is `[M, K]` and `b` is `[K, N]` in memory: one physical `K` dim each, addressed by the
@@ -149,17 +150,17 @@ fn run_split_k(m: usize, n: usize, k: usize, splits: usize) -> (HostData, HostDa
             TileSpec::direct(&[KB, M, N]),
         ),
         split_space.partitioning_arg(),
-        split_space.level(0),
+        split_space.partitioning().level(0),
         dtype,
     );
 
-    let fold_space = Launcher::implied(
+    let fold_space = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (KB, splits)]),
-            Tiling::leaf(&[(M, 1)]).cubes(&[M]).levels(),
+            Levels::leaf(&[(M, 1)]).cubes(&[M]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     reduce_splits::launch(
@@ -175,7 +176,7 @@ fn run_split_k(m: usize, n: usize, k: usize, splits: usize) -> (HostData, HostDa
             TileSpec::direct(&[M, N]),
         ),
         fold_space.partitioning_arg(),
-        fold_space.level(0),
+        fold_space.partitioning().level(0),
         dtype,
     );
 
@@ -324,29 +325,47 @@ fn atomic_split_matmul<E: Numeric>(
     let c = out.tile::<Const<1>>(comptime!(space.clone()));
     // The accumulator mirrors the output's grid at this level: opened above the walk, one
     // fragment per region, drained once through the sink after it.
-    let mut acc = c.block_accumulator::<E, E, E>(
-        &a,
-        &b,
-        comptime!(Fragments::new(
-            &c.space,
-            &a.space,
-            std::slice::from_ref(&level)
-        )),
-        REGISTER_BLOCK,
-        Monoid::Sum,
-    );
+    let mut acc = c.block_accumulator::<E, E, E>(&a, &b, REGISTER_BLOCK, Monoid::Sum);
     acc.zero();
     for region in space.over(&level) {
         let mut acc_region = acc.at(&region);
         acc_region.mma(&a.at(&region), &b.at(&region), Semiring::SUM_PROD);
     }
-    for r0 in c.over(&level).unrolled() {
-        let mut c_w = c.at(&r0);
-        c_w.copy_cast_from(&acc.at(&r0));
-    }
+    // Drained through the levels it was opened under, which is what puts a unit's block in front
+    // of its own columns; every unit writes there, and one writes where they repeat.
+    acc.drained_into(&c);
 }
 
-/// `a·b` with `K` dealt out over `splits` cubes, folded atomically into a zeroed output.
+/// The same, with the columns distributed out to the plane's units: one level more, and the unit level
+/// is walked like any other. A unit's block is then its own columns, which is what makes every
+/// unit a writer on the drain.
+#[cube(launch)]
+fn atomic_split_matmul_by_unit<E: Numeric>(
+    a: &TileArg<'_, E, Const<1>>,
+    b: &TileArg<'_, E, Const<1>>,
+    out: &AccumulateArg<'_, E>,
+    space: Partitioning,
+    #[comptime] cubes: Level,
+    #[comptime] plane_units: Level,
+    #[define(E)] _dtype: ElemType,
+) {
+    let a = a.tile(comptime!(space.clone()));
+    let b = b.tile(comptime!(space.clone()));
+    let c = out.tile::<Const<1>>(comptime!(space.clone()));
+    // Opened above both walks, so it holds what one unit of one cube sums: its own columns
+    // against that cube's slice of the contraction.
+    let mut acc = c.block_accumulator::<E, E, E>(&a, &b, REGISTER_BLOCK, Monoid::Sum);
+    acc.zero();
+    for cube in space.over(&cubes) {
+        for unit in cube.over(&plane_units) {
+            let mut acc_unit = acc.at(&unit);
+            acc_unit.mma(&a.at(&unit), &b.at(&unit), Semiring::SUM_PROD);
+        }
+    }
+    acc.drained_into(&c);
+}
+
+/// `a·b` with `K` distributed out over `splits` cubes, folded atomically into a zeroed output.
 fn run_atomic_split_k(m: usize, n: usize, k: usize, splits: usize) -> HostData {
     let client = cubecl::test_device().client();
     let dtype = f32::elem_type_native();
@@ -368,13 +387,13 @@ fn run_atomic_split_k(m: usize, n: usize, k: usize, splits: usize) -> HostData {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(K, k / splits)]).cubes(&[K]).levels(),
+            Levels::leaf(&[(K, k / splits)]).cubes(&[K]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     atomic_split_matmul::launch(
@@ -394,7 +413,7 @@ fn run_atomic_split_k(m: usize, n: usize, k: usize, splits: usize) -> HostData {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -466,14 +485,14 @@ fn the_atomic_drain_agrees_with_the_workspace() {
     }
 }
 
-/// The same fold with the lanes carrying cells of their own: `N` rides the plane's lanes while
-/// `K` rides the cubes, so a lane owns its columns and a cube owns its slice of the contraction.
+/// The same fold with the units carrying cells of their own: `N` rides the plane's units while
+/// `K` rides the cubes, so a unit owns its columns and a cube owns its slice of the contraction.
 ///
-/// The control on the writer election. A fold from lanes that repeat each other's work has to be
-/// made by one of them, and a fold from lanes that each hold their own cells by all of them: an
-/// election that cannot tell them apart is wrong one way; "lane zero writes" would drop this half.
+/// The control on the writer election. A fold from units that repeat each other's work has to be
+/// made by one of them, and a fold from units that each hold their own cells by all of them: an
+/// election that cannot tell them apart is wrong one way; "unit zero writes" would drop this half.
 #[test]
-fn an_atomic_drain_with_lanes_of_their_own() {
+fn an_atomic_drain_with_units_of_their_own() {
     let client = cubecl::test_device().client();
     if !client
         .properties()
@@ -489,8 +508,8 @@ fn an_atomic_drain_with_lanes_of_their_own() {
     let plane_size = client.properties().hardware.plane_size_max as usize;
     let dtype = f32::elem_type_native();
 
-    let (m, k, splits, per_lane) = (4usize, 16usize, 4usize, 2usize);
-    let n = plane_size * per_lane;
+    let (m, k, splits, per_unit) = (4usize, 16usize, 4usize, 2usize);
+    let n = plane_size * per_unit;
 
     let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
@@ -507,19 +526,19 @@ fn an_atomic_drain_with_lanes_of_their_own() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(N, per_lane), (K, k / splits)])
-                .lanes(&[(N, plane_size)])
+            Levels::leaf(&[(N, per_unit), (K, k / splits)])
+                .units(&[(N, plane_size)])
                 .cubes(&[K])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
-    atomic_split_matmul::launch(
+    atomic_split_matmul_by_unit::launch(
         &client,
         launcher.cube_count(),
         launcher.cube_dim(),
@@ -536,7 +555,8 @@ fn an_atomic_drain_with_lanes_of_their_own() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
+        launcher.partitioning().level(1),
         dtype,
     );
 
@@ -556,7 +576,7 @@ fn an_atomic_drain_with_lanes_of_their_own() {
 
 /// The same fold one scope down: `K` cut across the *planes* of a single cube. Planes share no
 /// registers either, so each holds a slice of every cell and the drain folds them in, and the
-/// election is per plane, so one lane of each folds its own plane's contribution.
+/// election is per plane, so one unit of each folds its own plane's contribution.
 ///
 /// One cube, so nothing here is a cube split at all: what is being checked is that the combine is
 /// about instances that cannot meet in registers, not about cubes in particular.
@@ -592,15 +612,15 @@ fn an_atomic_drain_folds_across_planes() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(K, k / num_planes)])
+            Levels::leaf(&[(K, k / num_planes)])
                 .planes(&[(K, num_planes)])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     atomic_split_matmul::launch(
@@ -620,7 +640,7 @@ fn an_atomic_drain_folds_across_planes() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -701,13 +721,13 @@ fn a_folding_output_contracts_in_place() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(K, k / splits)]).cubes(&[K]).levels(),
+            Levels::leaf(&[(K, k / splits)]).cubes(&[K]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     atomic_split_matmul_in_place::launch(
@@ -727,7 +747,7 @@ fn a_folding_output_contracts_in_place() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -749,7 +769,7 @@ fn a_folding_output_contracts_in_place() {
 //
 // A cmma accumulator stores through its intrinsic, which replaces and elects no writer, so on its
 // own it cannot drain into a store that folds. Opened with a scratch, the partition bounces each
-// fragment through smem, its one door, and the lanes fold its cells atomically, as a block does.
+// fragment through smem, its one door, and the units fold its cells atomically, as a block does.
 
 /// [`atomic_split_matmul`]'s tensor-core twin: the cube's slice of `K` staged and contracted in
 /// fragments, the accumulator opened with a scratch and drained through the folding sink.
@@ -759,8 +779,6 @@ fn atomic_split_cmma<E: Numeric>(
     b: &TileArg<'_, E, Const<1>>,
     out: &AccumulateArg<'_, E>,
     space: Partitioning,
-    #[comptime] planes: usize,
-    #[comptime] lanes: usize,
     #[define(E)] _dtype: ElemType,
 ) {
     let a = a.tile(comptime!(space.clone()));
@@ -771,22 +789,18 @@ fn atomic_split_cmma<E: Numeric>(
         let b_cube = b.at(&cube);
         let c_cube = c.at(&cube);
         let mut acc = c_cube
-            .cmma_accumulator::<E, E>(
-                &a_cube,
-                comptime!(Fragments::below(&c_cube, &a_cube)),
-                Monoid::Sum,
-            )
-            .with_scratch(Resident::OneTile, planes, lanes);
+            .cmma_accumulator::<E, E>(&a_cube, Monoid::Sum)
+            .with_scratch(Scratch::OneTile);
         acc.zero();
         let walk = cube.walk();
-        let mut ring = Ring::smem(
+        let mut stages = Stages::smem(
             &walk,
             &a_cube,
             &b_cube,
             comptime!(StageStorage::Strided),
             1usize,
         );
-        pipelined(walk, &mut ring, |slot, stage| {
+        stages.pipelined(walk, |slot, stage| {
             let mut acc_s = acc.at(stage);
             slot.consume(|a_s, b_s| {
                 acc_s.mma(a_s, b_s, Semiring::SUM_PROD);
@@ -824,12 +838,11 @@ fn folds_fragments(client: &cubecl::client::Client) -> bool {
     cmma && adds
 }
 
-/// `a·b` in fragments with `K` dealt to `splits` cubes, folded atomically into a zeroed output.
+/// `a·b` in fragments with `K` distributed to `splits` cubes, folded atomically into a zeroed output.
 fn run_atomic_split_cmma(k: usize, splits: usize) -> HostData {
     let client = cubecl::test_device().client();
     let dtype = f32::elem_type_native();
     let (m, n, edge) = (8usize, 8usize, 8usize);
-    let lanes = client.properties().hardware.plane_size_max as usize;
 
     let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
@@ -846,18 +859,18 @@ fn run_atomic_split_cmma(k: usize, splits: usize) -> HostData {
         .zeros()
         .generate_without_host_data();
 
-    // One plane per cube, the whole output per cube, `K` dealt in runs of one stage.
-    let launcher = Launcher::implied(
+    // One plane per cube, the whole output per cube, `K` distributed in runs of one stage.
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(M, m), (N, n), (K, edge)])
+            Levels::leaf(&[(M, m), (N, n), (K, edge)])
                 .walk_every(&[K])
                 .cubes(&[M, N, K])
                 .across(K, splits)
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     atomic_split_cmma::launch(
@@ -877,8 +890,6 @@ fn run_atomic_split_cmma(k: usize, splits: usize) -> HostData {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        1usize,
-        lanes,
         dtype,
     );
 
@@ -969,15 +980,13 @@ fn a_copy_into_a_folding_output_adds() {
         .generate_with_f32_host_data();
 
     // One cube over the whole tile, so the destination stays whole and each cell is added once.
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols)]),
-            Tiling::leaf(&[(M, rows), (N, cols)])
-                .cubes(&[M, N])
-                .levels(),
+            Levels::leaf(&[(M, rows), (N, cols)]).cubes(&[M, N]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
     copy_into_folding::launch(
         &client,

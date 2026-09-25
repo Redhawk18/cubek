@@ -35,9 +35,9 @@ use cubek_test_utils::{
     CatalogEntry, CategoryWork, ComputeWork, HostData, HostDataType, RunSamples, TileInput, client,
 };
 use cubek_tile::{
-    AccumulateArg, AccumulateArgLaunch, Axis, Fragments, KernelForm, Launcher, Monoid,
-    Partitioning, PhysicalAxisMap, Projection, RegisterBlock, Semiring, Space, TileArg,
-    TileArgLaunch, TileSpec, Tiling,
+    Accumulate, AccumulateArg, AccumulateArgLaunch, AccumulateExpand, Axis, Grid, Launcher, Levels,
+    Monoid, Partitioning, PhysicalAxisMap, Projection, RegisterBlock, Semiring, Space, TileArg,
+    TileArgLaunch, TileSpec,
 };
 
 /// Held fixed across mappings so the numbers compare the partitioning and not the instruction.
@@ -93,13 +93,8 @@ fn atomic_matmul<E: Numeric>(
         let mut c_cube = c.at(&region);
         let a_cube = a.at(&region);
         let b_cube = b.at(&region);
-        let mut acc = c_cube.block_accumulator::<E, E, E>(
-            &a_cube,
-            &b_cube,
-            comptime!(Fragments::below(&c_cube, &a_cube)),
-            REGISTER_BLOCK,
-            Monoid::Sum,
-        );
+        let mut acc =
+            c_cube.block_accumulator::<E, E, E>(&a_cube, &b_cube, REGISTER_BLOCK, Monoid::Sum);
         acc.mm(&a_cube, &b_cube, Semiring::SUM_PROD);
         c_cube.copy_cast_from(&acc);
     }
@@ -122,13 +117,8 @@ fn atomic_matmul_lanes<E: Numeric>(
         let c_cube = c.at(&cube);
         let a_cube = a.at(&cube);
         let b_cube = b.at(&cube);
-        let mut acc = c_cube.block_accumulator::<E, E, E>(
-            &a_cube,
-            &b_cube,
-            comptime!(Fragments::below(&c_cube, &a_cube)),
-            REGISTER_BLOCK,
-            Monoid::Sum,
-        );
+        let mut acc =
+            c_cube.block_accumulator::<E, E, E>(&a_cube, &b_cube, REGISTER_BLOCK, Monoid::Sum);
         acc.zero();
         for lane in cube {
             let mut acc_lane = acc.at(&lane);
@@ -213,57 +203,57 @@ impl Mapping {
         let Problem { m, n, k } = problem;
         let splits = self.splits();
         match self {
-            Mapping::DataParallel | Mapping::Atomic { .. } => Launcher::implied(
-                client,
-                Partitioning::new(
+            Mapping::DataParallel | Mapping::Atomic { .. } => {
+                let partitioning = Partitioning::new(
                     Space::new(&[(M, m), (N, n), (K, k)]),
-                    Tiling::leaf(&[(N, COLS), (K, k / splits)])
+                    Levels::leaf(&[(N, COLS), (K, k / splits)])
                         .cubes(&[N, K])
-                        .levels(),
-                ),
-                KernelForm::Static,
-            ),
-            Mapping::Workspace { .. } => Launcher::implied(
-                client,
-                Partitioning::new(
+                        .build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+            }
+            Mapping::Workspace { .. } => {
+                let partitioning = Partitioning::new(
                     Space::new(&[(M, m), (N, n), (KB, splits), (KI, k / splits)]),
-                    Tiling::leaf(&[(N, COLS)])
+                    Levels::leaf(&[(N, COLS)])
                         .cubes(&[N])
                         .batches(&[KB])
-                        .levels(),
-                ),
-                KernelForm::Static,
-            ),
+                        .build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+            }
             // The cube's slice of K cut again across the plane: each lane contracts its own
             // sixteenth (or whatever the lane count makes it), the plane combines in registers,
             // and one fold per cube reaches memory.
-            Mapping::AtomicLanes { .. } => Launcher::implied(
-                client,
-                Partitioning::new(
+            Mapping::AtomicLanes { .. } => {
+                let partitioning = Partitioning::new(
                     Space::new(&[(M, m), (N, n), (K, k)]),
-                    Tiling::leaf(&[(N, COLS), (K, k / splits / plane_size)])
-                        .lanes(&[(K, plane_size)])
+                    Levels::leaf(&[(N, COLS), (K, k / splits / plane_size)])
+                        .units(&[(K, plane_size)])
                         .cubes(&[N, K])
-                        .levels(),
-                ),
-                KernelForm::Static,
-            ),
+                        .build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+            }
         }
     }
 
     /// The fold pass's nest, for the mapping that has one.
     fn fold_space(self, client: &Client, problem: Problem) -> Launcher {
         let Problem { m, n, .. } = problem;
-        Launcher::implied(
-            client,
-            Partitioning::new(
+        {
+            let partitioning = Partitioning::new(
                 Space::new(&[(M, m), (N, n), (KB, self.splits())]),
-                Tiling::leaf(&[(M, 1), (N, FOLD_COLS)])
+                Levels::leaf(&[(M, 1), (N, FOLD_COLS)])
                     .cubes(&[M, N])
-                    .levels(),
-            ),
-            KernelForm::Static,
-        )
+                    .build(),
+            );
+            let concrete = partitioning.space().clone();
+            Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+        }
     }
 
     /// The lhs spec: `[M, K]` in memory either way, addressed by one logical axis or two.

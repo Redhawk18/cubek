@@ -23,10 +23,12 @@ use cubecl::{
 };
 use cubek_test_utils::{HostData, HostDataType, TestInput};
 
+use super::{Form, implied};
 use cubek_tile::*;
+use cubek_tile::{Boundary, BoundaryPolicy};
 
 /// What runs on the cells the last level cuts out: a sixteen-scalar register block, no edge
-/// specialization, no lane fan-out: the lines here run along the channel, not along `K`.
+/// specialization, no unit fan-out: the lines here run along the channel, not along `K`.
 const REGISTER_BLOCK: RegisterBlock = RegisterBlock::new(16);
 
 // Output positions, window taps, and the one channel axis every operand shares.
@@ -130,7 +132,7 @@ impl Depthwise {
     }
 
     fn check(&self, tile_oh: usize, tile_ow: usize, tile_c: usize) {
-        let launcher = Launcher::implied(
+        let launcher = implied(
             &cubecl::test_device().client(),
             Partitioning::new(
                 Space::new(&[
@@ -141,14 +143,14 @@ impl Depthwise {
                     (RH, self.rh),
                     (RW, self.rw),
                 ]),
-                Tiling::leaf(&[(C, 1), (OW, 1), (OH, 1)])
+                Levels::leaf(&[(C, 1), (OW, 1), (OH, 1)])
                     .walk(&[(OW, tile_ow), (OH, tile_oh)])
                     .planes(&[(C, tile_c)])
                     .cubes(&[C, OW, OH])
                     .batches(&[B])
-                    .levels(),
+                    .build(),
             ),
-            KernelForm::Static,
+            Form::Static,
         );
 
         // Two gathered physical axes, one per spatial pair; the channel axis rides identity, as
@@ -171,7 +173,7 @@ impl Depthwise {
                 PhysicalAxisMap::of(C),
             ],
         ))
-        .checked(true);
+        .boundary(BoundaryPolicy::Every(Boundary::Zero));
 
         let (got, want) = self.run(launcher, in_spec);
         for b in 0..self.b {

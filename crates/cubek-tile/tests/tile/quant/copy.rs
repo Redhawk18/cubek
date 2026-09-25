@@ -1,3 +1,4 @@
+use crate::tile::{Form, implied, uncut};
 use cubecl::{
     features::TypeUsage, ir::ElemType, prelude::*, std::tensor::layout::linear::linear_view,
     zspace::Shape,
@@ -7,10 +8,12 @@ use cubek_test_utils::{
     HostData, HostDataType, HostDataVec, StridedLayout, TestInput, TestOutcome, TileInput,
     ValidationResult, assert_equals_approx,
 };
+use cubek_tile::Quantization;
 use cubek_tile::{
-    Axis, DequantAt, KernelForm, Launcher, Partitioning, QuantTileArg, QuantTileArgLaunch, Space,
-    TileArg, TileArgLaunch, TileSpec, Tiling,
+    Axis, DequantAt, Levels, Partitioning, QuantTileArg, QuantTileArgLaunch, Space, TileArg,
+    TileArgLaunch, TileSpec,
 };
+use cubek_tile::{Boundary, BoundaryPolicy};
 
 const M: Axis = Axis(0);
 const N: Axis = Axis(1);
@@ -34,7 +37,7 @@ fn copy_non_quantized_matches_reference() {
         CubeDim::new_single(),
         input.arg(),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -52,16 +55,16 @@ fn copy_non_quantized_matches_reference() {
 fn copy_spread_across_cubes_and_planes_matches_reference() {
     let (m, n) = (4, 512);
     let client = cubecl::test_device().client();
-    let launch = Launcher::implied(
+    let launch = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n)]),
-            Tiling::leaf(&[(N, 32), (M, 1)])
+            Levels::leaf(&[(N, 32), (M, 1)])
                 .planes(&[(N, 4)])
                 .cubes(&[N, M])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
     let space = launch.space().clone();
 
@@ -137,7 +140,7 @@ fn copy_quantized_per_tensor_matches_reference() {
             DequantAt::Read,
         ),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         input_dtype,
         out_dtype,
     );
@@ -200,16 +203,21 @@ fn copy_quantized_per_tensor_vectorized_matches_reference() {
     let space = Space::new(&[(M, m), (N, n)]);
     let output = TileInput::builder(&client, space.clone()).untiled().zeros();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(space.clone(), vec![]),
-        KernelForm::Static,
+        Form::Static,
     );
     let input_op = launcher
         .arg(input.binding())
-        .subspace(&[M, N])
+        .axes(&[M, N])
         .vectorize(v)
-        .quantized(&[scales.binding()], scheme, DequantAt::Read)
+        .quantized(Quantization::new(
+            scales.binding(),
+            None,
+            scheme,
+            DequantAt::Read,
+        ))
         .build();
 
     let out_dtype = f32::elem_type_native();
@@ -219,7 +227,7 @@ fn copy_quantized_per_tensor_vectorized_matches_reference() {
         launcher.cube_dim(),
         input_op.bound_width(),
         v,
-        input_op.arg(),
+        input_op.quant_arg(),
         output.arg(),
         launcher.partitioning_arg(),
         input_dtype,
@@ -271,16 +279,21 @@ fn copy_quantized_per_tensor_packed_matches_reference() {
         .arange();
     let output = TileInput::builder(&client, space.clone()).untiled().zeros();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(space.clone(), vec![]),
-        KernelForm::Static,
+        Form::Static,
     );
     let input_op = launcher
         .arg(input.tile.handle().binding())
-        .subspace(&[M, N])
+        .axes(&[M, N])
         .vectorize(pack)
-        .quantized(&[input.scales_binding()], scheme, DequantAt::Read)
+        .quantized(Quantization::new(
+            input.scales_binding(),
+            None,
+            scheme,
+            DequantAt::Read,
+        ))
         .build();
 
     let input_dtype = u32::elem_type_native();
@@ -291,7 +304,7 @@ fn copy_quantized_per_tensor_packed_matches_reference() {
         launcher.cube_dim(),
         input_op.bound_width(),
         pack,
-        input_op.arg(),
+        input_op.quant_arg(),
         output.arg(),
         launcher.partitioning_arg(),
         input_dtype,
@@ -394,7 +407,7 @@ fn copy_quantized_lookup_matches_reference() {
         pack,
         input.arg(),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         u32::elem_type_native(),
         f32::elem_type_native(),
     );
@@ -460,7 +473,7 @@ fn run_quantized_subword(m: usize, n: usize, value: QuantValue, bm: usize, bn: u
         w,
         input.arg(),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         u32::elem_type_native(),
         f32::elem_type_native(),
     );
@@ -518,7 +531,7 @@ fn copy_quantized_subword_lookup_matches_reference() {
         w,
         input.arg(),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         u32::elem_type_native(),
         f32::elem_type_native(),
     );
@@ -587,7 +600,7 @@ fn run_quantized_packed(m: usize, n: usize, value: QuantValue, bm: usize, bn: us
         pack,
         input.arg(),
         output.arg(),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         input_dtype,
         out_dtype,
     );
@@ -681,15 +694,20 @@ fn two_level_without_global_scale_refused_by_the_builder() {
         .generate_without_host_data();
 
     let space = Space::new(&[(M, m), (N, n)]);
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(space.clone(), vec![]),
-        KernelForm::Dynamic,
+        Form::Dynamic,
     );
     launcher
         .arg(input.binding())
-        .subspace(&[M, N])
-        .quantized(&[scales.binding()], scheme, DequantAt::Read)
+        .axes(&[M, N])
+        .quantized(Quantization::new(
+            scales.binding(),
+            None,
+            scheme,
+            DequantAt::Read,
+        ))
         .build();
 }
 
@@ -732,15 +750,15 @@ fn run_quantized_block(m: usize, n: usize, bm: usize, bn: usize, global: Option<
         .generate_with_f32_host_data();
 
     // A nest that tiles into `bm×bn` blocks, one cube walking them.
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n)]),
-            Tiling::leaf(&[(M, bm), (N, bn)])
+            Levels::leaf(&[(M, bm), (N, bn)])
                 .walk_every(&[M, N])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
     // A partial last block overhangs its tile, so reads/writes past the tensor must be masked.
     let check = !m.is_multiple_of(bm) || !n.is_multiple_of(bn);
@@ -776,7 +794,14 @@ fn run_quantized_block(m: usize, n: usize, bm: usize, bn: usize, global: Option<
             scheme,
             DequantAt::Read,
         ),
-        TileArgLaunch::new(output.tensor_arg(1), output.spec().checked(check)),
+        TileArgLaunch::new(
+            output.tensor_arg(1),
+            output.spec().boundary(if check {
+                BoundaryPolicy::Every(Boundary::Zero)
+            } else {
+                BoundaryPolicy::Unchecked
+            }),
+        ),
         launcher.partitioning_arg(),
         input_dtype,
         out_dtype,

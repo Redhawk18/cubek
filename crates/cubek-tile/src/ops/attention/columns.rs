@@ -1,7 +1,7 @@
 //! Attention's matmul leaves at column ownership, the arm the software instruction runs: each
 //! unit owns every `team.units`-th column of the output, so a K or V block streamed along that
 //! axis is read from gmem once per team. The team is the caller's ([`TeamUnit`]): a kernel whose
-//! levels deal it reads the unit's place off them, one that lays it on the cube's x dim passes
+//! levels distribute it reads the unit's place off them, one that lays it on the cube's x dim passes
 //! [`TeamUnit::along_x`].
 //!
 //! The hardware form is the general contraction on a plane-resident accumulator
@@ -12,7 +12,7 @@
 
 use cubecl::prelude::*;
 
-use crate::{instruction::registers::horizontal, *};
+use crate::*;
 
 #[cube]
 impl<EA: Float> Tile<EA> {
@@ -27,10 +27,10 @@ impl<EA: Float> Tile<EA> {
         team: &TeamUnit,
         #[comptime] config: RegisterBlock,
     ) {
-        let rank = comptime!(self.space.rank());
-        let rows = comptime!(self.space.extent_at(rank - 2));
-        let cols = comptime!(self.space.extent_at(rank - 1));
-        let d = comptime!(q.space.extent_at(q.space.rank() - 1));
+        let rank = comptime!(self.place.space.rank());
+        let rows = comptime!(self.place.space.extent_at(rank - 2));
+        let cols = comptime!(self.place.space.extent_at(rank - 1));
+        let d = comptime!(q.place.space.extent_at(q.place.space.rank() - 1));
         let w = self.vector_size();
         let wq = q.vector_size();
         let wk = k.vector_size();
@@ -43,7 +43,7 @@ impl<EA: Float> Tile<EA> {
             "score_columns: q and k share one line width dividing the head dim"
         ));
         comptime!(assert!(
-            k.space.extent_at(k.space.rank() - 1) == d,
+            k.place.space.extent_at(k.place.space.rank() - 1) == d,
             "score_columns: k's trailing axis is the contracted head dim"
         ));
         let lines = comptime!(d / wq);
@@ -79,7 +79,7 @@ impl<EA: Float> Tile<EA> {
                 }
                 #[unroll]
                 for i in 0..height {
-                    let s = horizontal::vector::<EA, WI>(acc[i], wq, Monoid::Sum);
+                    let s = Monoid::reduce::<EA, WI>(acc[i], wq, Monoid::Sum);
                     out.write((base + i) * cols + c, Vector::cast_from(s));
                 }
             }
@@ -103,10 +103,10 @@ impl<EA: Float> Tile<EA> {
         team: &TeamUnit,
         #[comptime] config: RegisterBlock,
     ) {
-        let rank = comptime!(self.space.rank());
-        let rows = comptime!(self.space.extent_at(rank - 2));
-        let val_dim = comptime!(self.space.extent_at(rank - 1));
-        let cols = comptime!(p.space.extent_at(p.space.rank() - 1));
+        let rank = comptime!(self.place.space.rank());
+        let rows = comptime!(self.place.space.extent_at(rank - 2));
+        let val_dim = comptime!(self.place.space.extent_at(rank - 1));
+        let cols = comptime!(p.place.space.extent_at(p.place.space.rank() - 1));
         let w = self.vector_size();
         let wp = p.vector_size();
         let wv = val.vector_size();

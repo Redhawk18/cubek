@@ -17,10 +17,13 @@ use cubecl::{
 };
 use cubecl_common::{e2m1, e4m3};
 use cubek_test_utils::{HostData, HostDataType, TestInput, TestOutcome, ValidationResult};
+
+use crate::tile::uncut;
 use cubek_tile::*;
 use half::f16;
 
 use super::matmul::require_cmma_8x8x8_f32;
+use super::{Form, implied};
 
 const M: Axis = Axis(0);
 const N: Axis = Axis(1);
@@ -62,17 +65,15 @@ fn packed_matmul<E: Numeric, SW: Size>(
 ) {
     let w = w
         .tile_as::<E>(comptime!(space.clone()))
-        .scaled(&ComptimeOption::new_Some(
-            scale.tile(comptime!(space.clone())),
-        ));
+        .mul(&scale.tile(comptime!(space.clone())));
     let x = x.tile(comptime!(space.clone()));
     let mut c = c.tile(comptime!(space.clone()));
     c.zero();
     for region in space.over(&level) {
         let mut c_r = c.at(&region);
-        c_r.mma_scaled_with(
+        c_r.mma_with(
             &w.at(&region),
-            &x.at(&region).plain(),
+            &x.at(&region),
             REGISTER_BLOCK,
             Semiring::SUM_PROD,
         );
@@ -94,20 +95,16 @@ fn nvfp4_shaped_matmul<E: Numeric>(
     // Two levels, said twice: the blocks, then the factor over the whole tensor.
     let w = w
         .tile_as::<E>(comptime!(space.clone()))
-        .scaled(&ComptimeOption::new_Some(
-            blocks.tile(comptime!(space.clone())),
-        ))
-        .scaled(&ComptimeOption::new_Some(
-            global.tile(comptime!(space.clone())),
-        ));
+        .mul(&blocks.tile(comptime!(space.clone())))
+        .mul(&global.tile(comptime!(space.clone())));
     let x = x.tile(comptime!(space.clone()));
     let mut c = c.tile(comptime!(space.clone()));
     c.zero();
     for region in space.over(&level) {
         let mut c_r = c.at(&region);
-        c_r.mma_scaled_with(
+        c_r.mma_with(
             &w.at(&region),
-            &x.at(&region).plain(),
+            &x.at(&region),
             REGISTER_BLOCK,
             Semiring::SUM_PROD,
         );
@@ -172,15 +169,15 @@ fn nvfp4_shaped_decode() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     nvfp4_shaped_matmul::launch(
@@ -226,7 +223,7 @@ fn nvfp4_shaped_decode() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -264,15 +261,13 @@ fn packed_matmul_rhs<E: Numeric, V: Size>(
     let x = x.tile(comptime!(space.clone()));
     let w = w
         .tile_as::<E>(comptime!(space.clone()))
-        .scaled(&ComptimeOption::new_Some(
-            scale.tile(comptime!(space.clone())),
-        ));
+        .mul(&scale.tile(comptime!(space.clone())));
     let mut c = c.tile(comptime!(space.clone()));
     c.zero();
     for region in space.over(&level) {
         let mut c_r = c.at(&region);
-        c_r.mma_scaled_with(
-            &x.at(&region).plain(),
+        c_r.mma_with(
+            &x.at(&region),
             &w.at(&region),
             REGISTER_BLOCK,
             Semiring::SUM_PROD,
@@ -295,16 +290,14 @@ fn native_matmul<E: Numeric>(
 ) {
     let w = w.tile(comptime!(space.clone()));
     let x = x.tile(comptime!(space.clone()));
-    let w = w.scaled(&ComptimeOption::new_Some(
-        scale.tile(comptime!(space.clone())),
-    ));
+    let w = w.mul(&scale.tile(comptime!(space.clone())));
     let mut c = c.tile(comptime!(space.clone()));
     c.zero();
     for region in space.over(&level) {
         let mut c_r = c.at(&region);
-        c_r.mma_scaled_with(
+        c_r.mma_with(
             &w.at(&region),
-            &x.at(&region).plain(),
+            &x.at(&region),
             REGISTER_BLOCK,
             Semiring::SUM_PROD,
         );
@@ -325,9 +318,7 @@ fn packed_gemv<E: Numeric, V: Size>(
 ) {
     let x = x.tile(comptime!(space.clone()));
     let values = w.tile_as::<E>(comptime!(space.clone()));
-    let w = values.scaled(&ComptimeOption::new_Some(
-        scale.tile(comptime!(space.clone())),
-    ));
+    let w = values.mul(&scale.tile(comptime!(space.clone())));
     let c = c.tile(comptime!(space.clone()));
     for cube in space {
         let x = x.at(&cube);
@@ -335,17 +326,11 @@ fn packed_gemv<E: Numeric, V: Size>(
         let w = w.at(&cube);
         let c = c.at(&cube);
         // The accumulator lives in registers across the whole walk and drains once.
-        let mut acc = c.block_accumulator::<E, E, E>(
-            &x,
-            &values,
-            comptime!(Fragments::below(&c, &x)),
-            REGISTER_BLOCK,
-            Monoid::Sum,
-        );
+        let mut acc = c.block_accumulator::<E, E, E>(&x, &values, REGISTER_BLOCK, Monoid::Sum);
         acc.zero();
         for step in cube {
             let mut acc_s = acc.at(&step);
-            acc_s.mma_scaled(&x.at(&step).plain(), &w.at(&step), Semiring::SUM_PROD);
+            acc_s.mma(&x.at(&step), &w.at(&step), Semiring::SUM_PROD);
         }
         for r0 in c.walk().unrolled() {
             let mut c_w = c.at(&r0);
@@ -368,17 +353,15 @@ fn packed_matmul_byte_scales<E: Numeric>(
 ) {
     let w = w
         .tile_as::<E>(comptime!(space.clone()))
-        .scaled(&ComptimeOption::new_Some(
-            scale.tile_as::<E>(comptime!(space.clone())),
-        ));
+        .mul(&scale.tile_as::<E>(comptime!(space.clone())));
     let x = x.tile(comptime!(space.clone()));
     let mut c = c.tile(comptime!(space.clone()));
     c.zero();
     for region in space.over(&level) {
         let mut c_r = c.at(&region);
-        c_r.mma_scaled_with(
+        c_r.mma_with(
             &w.at(&region),
-            &x.at(&region).plain(),
+            &x.at(&region),
             REGISTER_BLOCK,
             Semiring::SUM_PROD,
         );
@@ -397,26 +380,18 @@ fn packed_gemv_byte_scales<E: Numeric, V: Size>(
 ) {
     let x = x.tile(comptime!(space.clone()));
     let values = w.tile_as::<E>(comptime!(space.clone()));
-    let w = values.scaled(&ComptimeOption::new_Some(
-        scale.tile_as::<E>(comptime!(space.clone())),
-    ));
+    let w = values.mul(&scale.tile_as::<E>(comptime!(space.clone())));
     let c = c.tile(comptime!(space.clone()));
     for cube in space {
         let x = x.at(&cube);
         let values = values.at(&cube);
         let w = w.at(&cube);
         let c = c.at(&cube);
-        let mut acc = c.block_accumulator::<E, E, E>(
-            &x,
-            &values,
-            comptime!(Fragments::below(&c, &x)),
-            REGISTER_BLOCK,
-            Monoid::Sum,
-        );
+        let mut acc = c.block_accumulator::<E, E, E>(&x, &values, REGISTER_BLOCK, Monoid::Sum);
         acc.zero();
         for step in cube {
             let mut acc_s = acc.at(&step);
-            acc_s.mma_scaled(&x.at(&step).plain(), &w.at(&step), Semiring::SUM_PROD);
+            acc_s.mma(&x.at(&step), &w.at(&step), Semiring::SUM_PROD);
         }
         for r0 in c.walk().unrolled() {
             let mut c_w = c.at(&r0);
@@ -426,7 +401,7 @@ fn packed_gemv_byte_scales<E: Numeric, V: Size>(
 }
 
 /// The prefill shape on the tensor cores: a packed weight on the rhs with byte scales, landed
-/// unpacked and scaled by the plane's lanes, contracted through the plain cmma instruction.
+/// unpacked and scaled by the plane's units, contracted through the plain cmma instruction.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn packed_cmma_rhs<E: Numeric>(
@@ -443,25 +418,15 @@ fn packed_cmma_rhs<E: Numeric>(
     let w = w
         .tile_as::<E>(comptime!(space.clone()))
         .with_landing()
-        .scaled(&ComptimeOption::new_Some(
-            scale.tile_as::<E>(comptime!(space.clone())),
-        ));
+        .mul(&scale.tile_as::<E>(comptime!(space.clone())));
     let c = c.tile(comptime!(space.clone()));
-    let mut acc = c.cmma_accumulator::<E, E>(
-        &x,
-        comptime!(Fragments::new(
-            &c.space,
-            &x.space,
-            std::slice::from_ref(&level)
-        )),
-        Monoid::Sum,
-    );
+    let mut acc = c.cmma_accumulator::<E, E>(&x, Monoid::Sum);
     acc.zero();
     // The level cuts the columns into two fragments and walks `K`: unrolled, so each region
     // selects its fragment at comptime.
     for region in space.over(&level).unrolled() {
         let mut acc_r = acc.at(&region);
-        acc_r.mma_scaled(&x.at(&region).plain(), &w.at(&region), Semiring::SUM_PROD);
+        acc_r.mma(&x.at(&region), &w.at(&region), Semiring::SUM_PROD);
     }
     for r0 in c.over(&level).unrolled() {
         let mut c_w = c.at(&r0);
@@ -528,7 +493,7 @@ fn eight_bit_fields_unpack_on_read() {
             output.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[M, N]),
         ),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -601,7 +566,7 @@ fn four_bit_fields_unpack_on_read() {
             output.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[M, N]),
         ),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -675,7 +640,7 @@ fn fp4_codes_unpack_on_read() {
             output.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[M, N]),
         ),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -748,7 +713,7 @@ fn two_bit_fields_unpack_on_read() {
             output.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[M, N]),
         ),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -821,15 +786,15 @@ fn a_packed_operand_contracts_against_its_scales() {
         .generate_without_host_data();
 
     // A region sits inside one block, and the packed line is one word of it.
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul::launch(
@@ -871,7 +836,7 @@ fn a_packed_operand_contracts_against_its_scales() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -943,15 +908,15 @@ fn eight_bit_fields_contract_against_their_scales() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, factor)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul::launch(
@@ -992,7 +957,7 @@ fn eight_bit_fields_contract_against_their_scales() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1068,15 +1033,15 @@ fn a_folded_walk_takes_its_scales_several_at_a_time() {
         .generate_without_host_data();
 
     // A region sits inside one block, and the packed line is one word of it.
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 2), (KI, factor)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 2), (KI, factor)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul::launch(
@@ -1118,7 +1083,7 @@ fn a_folded_walk_takes_its_scales_several_at_a_time() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1196,7 +1161,7 @@ fn a_packed_rhs_contracts_against_its_scales() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -1206,11 +1171,11 @@ fn a_packed_rhs_contracts_against_its_scales() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
+            Levels::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
                 .walk_every(&[M, NB, NI, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul_rhs::launch(
@@ -1260,7 +1225,7 @@ fn a_packed_rhs_contracts_against_its_scales() {
             )),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1338,7 +1303,7 @@ fn an_eight_bit_packed_rhs_contracts_against_its_scales() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -1348,11 +1313,11 @@ fn an_eight_bit_packed_rhs_contracts_against_its_scales() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
+            Levels::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
                 .walk_every(&[M, NB, NI, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul_rhs::launch(
@@ -1402,7 +1367,7 @@ fn an_eight_bit_packed_rhs_contracts_against_its_scales() {
             )),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1483,7 +1448,7 @@ fn several_lines_may_share_one_scale() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -1493,11 +1458,11 @@ fn several_lines_may_share_one_scale() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
+            Levels::leaf(&[(M, rows), (NB, blocks_n), (NI, bn), (KB, 1), (KI, block_k)])
                 .walk_every(&[M, NB, NI, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_matmul_rhs::launch(
@@ -1547,7 +1512,7 @@ fn several_lines_may_share_one_scale() {
             )),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1608,15 +1573,15 @@ fn an_i8_operand_contracts_against_its_scales() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, block)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 1), (KI, block)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     native_matmul::launch(
@@ -1655,7 +1620,7 @@ fn an_i8_operand_contracts_against_its_scales() {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -1734,7 +1699,7 @@ fn a_packed_decode_gemv_runs_in_this_spelling() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -1744,12 +1709,12 @@ fn a_packed_decode_gemv_runs_in_this_spelling() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(NB, 1), (KB, 1)])
+            Levels::leaf(&[(NB, 1), (KB, 1)])
                 .walk_every(&[KB])
                 .cubes(&[NB])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_gemv::launch(
@@ -1872,7 +1837,7 @@ fn an_eight_bit_decode_gemv_runs_in_this_spelling() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -1882,12 +1847,12 @@ fn an_eight_bit_decode_gemv_runs_in_this_spelling() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(NB, 1), (KB, 1)])
+            Levels::leaf(&[(NB, 1), (KB, 1)])
                 .walk_every(&[KB])
                 .cubes(&[NB])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_gemv::launch(
@@ -1970,13 +1935,7 @@ fn packed_gemv_unscaled<E: Numeric, V: Size>(
         let x = x.at(&cube);
         let w = w.at(&cube);
         let c = c.at(&cube);
-        let mut acc = c.block_accumulator::<E, E, E>(
-            &x,
-            &w,
-            comptime!(Fragments::below(&c, &x)),
-            REGISTER_BLOCK,
-            Monoid::Sum,
-        );
+        let mut acc = c.block_accumulator::<E, E, E>(&x, &w, REGISTER_BLOCK, Monoid::Sum);
         acc.zero();
         for step in cube {
             let mut acc_s = acc.at(&step);
@@ -2046,16 +2005,16 @@ fn a_packed_rhs_drains_from_a_promoted_accumulator() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, 1), (N, cols), (KB, blocks_k), (KI, block_k)]),
-            Tiling::leaf(&[(N, bn), (KB, 1)])
+            Levels::leaf(&[(N, bn), (KB, 1)])
                 .walk_every(&[KB])
                 .cubes(&[N])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_gemv_unscaled::launch(
@@ -2159,7 +2118,7 @@ fn e4m3_fields_unpack_on_read() {
             output.clone().binding().into_tensor_arg(),
             TileSpec::direct(&[M, N]),
         ),
-        space.launch_arg(&space),
+        uncut(&client, &space, &space).partitioning_arg(),
         dtype,
     );
 
@@ -2242,16 +2201,16 @@ fn check_ue8m0_scales(block: usize, blocks: usize) {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
             // Four scales a word, so a region is the four blocks one read of them covers.
-            Tiling::leaf(&[(M, rows), (N, cols), (KB, 4), (KI, factor)])
+            Levels::leaf(&[(M, rows), (N, cols), (KB, 4), (KI, factor)])
                 .walk_every(&[M, N, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let w_projection = Projection::new(
@@ -2288,7 +2247,7 @@ fn check_ue8m0_scales(block: usize, blocks: usize) {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -2390,21 +2349,21 @@ fn check_float_scales(kind: FloatKind, block: usize, blocks: usize) {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, rows), (N, cols), (KB, blocks), (KI, block)]),
             // A region is the blocks one word of scales covers.
-            Tiling::leaf(&[
+            Levels::leaf(&[
                 (M, rows),
                 (N, cols),
-                (KB, float_field(kind).per_word()),
+                (KB, Field::of_float(kind).per_word()),
                 (KI, factor),
             ])
             .walk_every(&[M, N, KB, KI])
-            .levels(),
+            .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let w_projection = Projection::new(
@@ -2441,7 +2400,7 @@ fn check_float_scales(kind: FloatKind, block: usize, blocks: usize) {
             TileSpec::direct(&[M, N]),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 
@@ -2522,7 +2481,7 @@ fn e4m3_scales_reach_the_promoted_block() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -2533,12 +2492,12 @@ fn e4m3_scales_reach_the_promoted_block() {
                 (KI, block_k),
             ]),
             // One read of the scales is four column blocks, so one cube owns all four.
-            Tiling::leaf(&[(NB, 4), (KB, 1)])
+            Levels::leaf(&[(NB, 4), (KB, 1)])
                 .walk_every(&[KB])
                 .cubes(&[NB])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_gemv_byte_scales::launch(
@@ -2675,7 +2634,7 @@ fn a_packed_rhs_reaches_the_tensor_cores() {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -2685,11 +2644,11 @@ fn a_packed_rhs_reaches_the_tensor_cores() {
                 (KB, blocks_k),
                 (KI, block_k),
             ]),
-            Tiling::leaf(&[(M, rows), (NB, 8 / bn), (NI, bn), (KB, 1), (KI, block_k)])
+            Levels::leaf(&[(M, rows), (NB, 8 / bn), (NI, bn), (KB, 1), (KI, block_k)])
                 .walk_every(&[M, NB, NI, KB, KI])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     packed_cmma_rhs::launch(
@@ -2736,7 +2695,7 @@ fn a_packed_rhs_reaches_the_tensor_cores() {
             )),
         ),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
 

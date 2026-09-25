@@ -123,8 +123,8 @@ impl DepthwiseSpace {
             tile_c.is_multiple_of(plane_c),
             "DepthwiseSpace: {plane_size} lanes of {width} channels do not divide a tile of {tile_c}"
         );
-        let lanes = Tiling::leaf(&[(C, width), (OW, cols), (OH, 1)])
-            .lanes(&[(C, plane_size)])
+        let lanes = Levels::leaf(&[(C, width), (OW, cols), (OH, 1)])
+            .units(&[(C, plane_size)])
             .interleaved(C);
         let lines = match tile_c / plane_c {
             1 => lanes,
@@ -134,7 +134,7 @@ impl DepthwiseSpace {
             .planes(&[(OH, rows)])
             .cubes(&[C, OW, OH])
             .batches(&[B])
-            .levels()
+            .build()
     }
 
     pub fn space(&self) -> Space {
@@ -428,8 +428,20 @@ pub fn launch_depthwise(
     );
     let tile_c = tiling.channel_tile(lanes, width)?;
     let plan = tiling.plan(&geometry, lanes, tile_c, width);
-    let launch =
-        Launcher::partitioned(client, plan.partitioning(), plan.grid(), KernelForm::Static);
+    let launch = {
+        let partitioning = plan.partitioning();
+        let concrete = partitioning.space().clone();
+        let (cube_count, cube_dim) = plan.grid();
+        Launcher::new(
+            client,
+            partitioning,
+            &concrete,
+            Grid::Stated {
+                cube_count,
+                cube_dim,
+            },
+        )
+    };
 
     // A tile that does not divide its axis leaves the last cube short, and a short cube's
     // terminal tile is still the full comptime size — so the cells past the end are addressed and
@@ -712,7 +724,7 @@ mod tests {
     #[test]
     fn the_depthwise_routine_states_three_levels() {
         assert_eq!(
-            plan(1, 1).partitioning().labelled(&LABELS).to_string(),
+            plan(1, 1).partitioning().table(&LABELS).to_string(),
             [
                 "        b × oh × ow ×  c × rh × rw    b × oh × ow ×   c × rh × rw",
                 "",
@@ -733,7 +745,7 @@ mod tests {
     #[test]
     fn a_lane_holding_several_channel_lines_walks_them() {
         assert_eq!(
-            plan(4, 2).partitioning().labelled(&LABELS).to_string(),
+            plan(4, 2).partitioning().table(&LABELS).to_string(),
             [
                 "        b × oh × ow ×  c × rh × rw    b × oh × ow ×   c × rh × rw",
                 "",

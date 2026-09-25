@@ -8,6 +8,7 @@
 //! along `K` exactly as an unrouted one does.
 #![allow(non_snake_case)]
 
+use super::{Form, implied};
 use cubecl::{client::Client, prelude::*, std::tensor::TensorHandle, zspace::Shape};
 use cubek_test_utils::{HostData, HostDataType, TestInput, skip_unless_plane_holds};
 use cubek_tile::*;
@@ -147,7 +148,7 @@ fn routed_matmul_kernel<E: Numeric>(
     }
 }
 
-/// The routed weights staged in shared memory rather than read where they lie: the ring is built
+/// The routed weights staged in shared memory rather than read where they lie: the stages are built
 /// over the routed walk, so what it fills is the expert the table named.
 #[cube(launch)]
 fn routed_staged_matmul_kernel<E: Numeric>(
@@ -168,8 +169,8 @@ fn routed_staged_matmul_kernel<E: Numeric>(
         let e = routes[tok.coord(M)] as usize;
         let experts = tok.over(&expert).routed(EXPERT, e);
 
-        let mut ring = Ring::smem_single(&experts, &w, StageStorage::Strided, 1usize);
-        pipelined(experts, &mut ring, |slot, slab| {
+        let mut stages = Stages::smem_single(&experts, &w, StageStorage::Strided, 1usize);
+        stages.pipelined(experts, |slot, slab| {
             let mut o = out.at(slab);
             slot.consume(|w_s| {
                 o.mm_with(&x.at(slab), w_s, REGISTER_BLOCK, Semiring::SUM_PROD);
@@ -184,16 +185,16 @@ fn routed_staged_matmul_kernel<E: Numeric>(
 /// Nothing here says a token uses one expert; the walk does.
 fn per_token_operands(client: &Client) -> (Launcher, TensorHandle, TensorHandle) {
     let f32_ty = f32::elem_type_native();
-    let launcher = Launcher::implied(
+    let launcher = implied(
         client,
         Partitioning::new(
             Space::new(&[(M, TOKENS), (N, FEATURES), (K, FEATURES), (EXPERT, EXPERTS)]),
-            Tiling::leaf(&[(M, 1), (EXPERT, 1)])
+            Levels::leaf(&[(M, 1), (EXPERT, 1)])
                 .walk_every(&[EXPERT])
                 .walk_every(&[M])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let (x, _) = TestInput::builder(client.clone(), Shape::new([TOKENS, FEATURES]))
@@ -229,8 +230,8 @@ fn run(routes: &[u32]) -> HostData {
         ),
         table.binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
-        launcher.level(1),
+        launcher.partitioning().level(0),
+        launcher.partitioning().level(1),
         f32::elem_type_native(),
     );
 
@@ -258,8 +259,8 @@ fn run_staged(routes: &[u32]) -> HostData {
         ),
         table.binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
-        launcher.level(1),
+        launcher.partitioning().level(0),
+        launcher.partitioning().level(1),
         f32::elem_type_native(),
     );
 
@@ -275,7 +276,7 @@ fn a_routed_walk_contracts_each_token_against_the_expert_its_table_names() {
     }
 }
 
-/// Staging under a routed coordinate: the stage is filled from the expert the route named, not
+/// Slot under a routed coordinate: the stage is filled from the expert the route named, not
 /// from the first one and then reused. A window displacement living on the operand would owe a
 /// refusal (a staged operand inherits it); here the coordinate is the walk's, the stage per region.
 #[test]
@@ -318,13 +319,8 @@ fn routed_block_matmul_kernel<E: Numeric>(
             let out_s = out.at(&slab);
             let x_s = x.at(&slab);
             let w_s = w.at(&slab);
-            let mut acc = out_s.block_accumulator::<E, E, E>(
-                &x_s,
-                &w_s,
-                comptime!(Fragments::below(&out_s, &x_s)),
-                REGISTER_BLOCK,
-                Monoid::Sum,
-            );
+            let mut acc =
+                out_s.block_accumulator::<E, E, E>(&x_s, &w_s, REGISTER_BLOCK, Monoid::Sum);
             acc.zero();
             for step in slab.over(&depth) {
                 let mut acc_s = acc.at(&step);
@@ -342,17 +338,17 @@ fn run_block(routes: &[u32]) -> HostData {
     let client = cubecl::test_device().client();
     let f32_ty = f32::elem_type_native();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, TOKENS), (N, FEATURES), (K, DEPTH), (EXPERT, EXPERTS)]),
-            Tiling::leaf(&[(M, 1), (EXPERT, 1), (K, LINE)])
+            Levels::leaf(&[(M, 1), (EXPERT, 1), (K, LINE)])
                 .walk_every(&[K])
                 .walk_every(&[EXPERT])
                 .walk_every(&[M])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let (x, _) = TestInput::builder(client.clone(), Shape::new([TOKENS, DEPTH]))
@@ -381,9 +377,9 @@ fn run_block(routes: &[u32]) -> HostData {
         ),
         table.binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
-        launcher.level(1),
-        launcher.level(2),
+        launcher.partitioning().level(0),
+        launcher.partitioning().level(1),
+        launcher.partitioning().level(2),
         f32_ty,
     );
 
@@ -391,7 +387,7 @@ fn run_block(routes: &[u32]) -> HostData {
 }
 
 /// A routed walk contracting in a register block at a folded step: the weights line along `K`, so
-/// a step consumes a whole line of each operand and the block's lanes are one cell's partials.
+/// a step consumes a whole line of each operand and the block's units are one cell's partials.
 ///
 /// The expert axis holds one value under the route, so it contracts nothing. Counted as a
 /// contracted axis it becomes the fastest one, not the axis the operands line along, and the fold
@@ -426,13 +422,13 @@ fn launch_routed_on(axis: Axis) -> f32 {
     let client = cubecl::test_device().client();
     let f32_ty = f32::elem_type_native();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, TOKENS), (EXPERT, EXPERTS)]),
-            Tiling::leaf(&[(EXPERT, 1)]).walk_every(&[EXPERT]).levels(),
+            Levels::leaf(&[(EXPERT, 1)]).walk_every(&[EXPERT]).build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let (k_handle, _) = TestInput::builder(client.clone(), Shape::new([TOKENS, EXPERTS]))
@@ -454,7 +450,7 @@ fn launch_routed_on(axis: Axis) -> f32 {
         ),
         out_handle.clone().binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         axis,
     );
 
@@ -469,70 +465,70 @@ fn routing_an_axis_of_the_space_is_the_only_case_checked_here() {
     assert_eq!(launch_routed_on(EXPERT), 1.0);
 }
 
-/// Each lane writes the expert coordinate its region carried, so a walk that folds the lane's own
-/// position into a routed axis is visible as lanes disagreeing.
+/// Each unit writes the expert coordinate its region carried, so a walk that folds the unit's own
+/// position into a routed axis is visible as units disagreeing.
 #[cube(launch)]
-fn routed_lanes_kernel(
+fn routed_units_kernel(
     out: &mut Tensor<f32>,
     space: Partitioning,
-    #[comptime] lanes: Level,
+    #[comptime] plane_units: Level,
     #[comptime] target: usize,
 ) {
     for region in space
-        .over(&lanes)
+        .over(&plane_units)
         .routed(EXPERT, comptime!(target).runtime())
     {
         out[UNIT_POS_X as usize] = f32::cast_from(region.coord(EXPERT) as u32);
     }
 }
 
-/// A routed axis spread across the plane's lanes: naming a coordinate names it for every lane,
-/// since a lane's own share of the axis is what the route replaces rather than shifts. Without
-/// that, lane `l` would read expert `target + l` off one shared operand.
+/// A routed axis spread across the plane's units: naming a coordinate names it for every unit,
+/// since a unit's own share of the axis is what the route replaces rather than shifts. Without
+/// that, unit `l` would read expert `target + l` off one shared operand.
 #[test]
-fn a_routed_axis_reads_the_same_coordinate_in_every_lane() {
+fn a_routed_axis_reads_the_same_coordinate_in_every_unit() {
     let client = cubecl::test_device().client();
     let f32_ty = f32::elem_type_native();
     // A unit level must partition the plane exactly, so the axis is as wide as the plane.
-    let lanes = client.properties().hardware.plane_size_max as usize;
+    let plane_units = client.properties().hardware.plane_size_max as usize;
     let target = 2usize;
     // The axis is as wide as the plane, so the plane must hold the expert the route names.
     if skip_unless_plane_holds(&client, target as u32 + 1) {
         return;
     }
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
-            Space::new(&[(EXPERT, lanes)]),
-            Tiling::leaf(&[(EXPERT, 1)])
-                .lanes(&[(EXPERT, lanes)])
-                .levels(),
+            Space::new(&[(EXPERT, plane_units)]),
+            Levels::leaf(&[(EXPERT, 1)])
+                .units(&[(EXPERT, plane_units)])
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
-    let out_handle = TestInput::builder(client.clone(), Shape::new([lanes]))
+    let out_handle = TestInput::builder(client.clone(), Shape::new([plane_units]))
         .dtype(f32_ty)
-        .custom(vec![-1.0; lanes])
+        .custom(vec![-1.0; plane_units])
         .generate_without_host_data();
 
-    routed_lanes_kernel::launch(
+    routed_units_kernel::launch(
         &client,
         launcher.cube_count(),
-        CubeDim::new_2d(lanes as u32, 1),
+        CubeDim::new_2d(plane_units as u32, 1),
         out_handle.clone().binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         target,
     );
 
     let got = HostData::from_tensor_handle(&client, out_handle, HostDataType::F32);
-    for lane in 0..lanes {
+    for plane_unit in 0..plane_units {
         assert_eq!(
-            got.get_f32(&[lane]),
+            got.get_f32(&[plane_unit]),
             target as f32,
-            "lane {lane} read a different expert than the one the route named"
+            "unit {plane_unit} read a different expert than the one the route named"
         );
     }
 }

@@ -2,8 +2,8 @@ use super::geometry::TileGeometry;
 use cubecl::client::Client;
 use cubecl::{CubeCount, CubeDim};
 use cubek_tile::{
-    Axis, Compaction, Level, Partitioning, PhysicalAxisMap, Projection, RegisterBlock, Space,
-    Tiling,
+    Axis, Compaction, Level, Levels, Partitioning, PhysicalAxisMap, Projection, RegisterBlock,
+    Space,
 };
 
 pub const BATCH: Axis = Axis(0);
@@ -31,7 +31,7 @@ const LABELS: [(Axis, &str); 6] = [
 pub fn register_block(client: &Client) -> RegisterBlock {
     match client.properties().hardware.num_cpu_cores {
         Some(_) => RegisterBlock::new(256).split_edge(),
-        None => RegisterBlock::new(64).lane_fanout(),
+        None => RegisterBlock::new(64).component_fanout(),
     }
 }
 
@@ -85,17 +85,17 @@ impl InterpolateSpace {
         .into_iter()
         .filter(|&(_, lanes)| lanes > 1)
         .collect();
-        Tiling::leaf(&[
+        Levels::leaf(&[
             (OUTPUT_W, geometry.cols_per_lane),
             (CHANNEL, geometry.channel_block),
             (OUTPUT_H, geometry.rows_per_plane),
         ])
-        .lanes(&lanes)
+        .units(&lanes)
         .planes(&[(OUTPUT_H, geometry.planes_per_cube)])
         .walk_every(&[CHANNEL])
         .cubes(&[OUTPUT_W, OUTPUT_H])
         .batches(&[BATCH])
-        .levels()
+        .build()
     }
 
     pub fn space(&self) -> Space {
@@ -157,7 +157,7 @@ pub fn stage_window_bytes(
         other => panic!("stage_window_bytes: {other:?} is not an axis of the interpolation space"),
     };
     let window_vectors: usize =
-        Compaction::of(&input_projection(row, col, radius), vector_size, extent_of)
+        Compaction::new(&input_projection(row, col, radius), vector_size, extent_of)
             .extents()
             .iter()
             .product();
@@ -195,17 +195,17 @@ mod tests {
     #[test]
     fn the_interpolate_routine_states_four_levels() {
         assert_eq!(
-            plan(16).partitioning().labelled(&LABELS).to_string(),
+            plan(16).partitioning().table(&LABELS).to_string(),
             [
-                "        b × oh × ow × th × tw × c    b ×  oh ×  ow × th × tw ×  c",
+                "                        b × oh × ow × th × tw × c    b ×  oh ×  ow × th × tw ×  c",
                 "",
-                "  ◦     · ×  · ×  · ×  · ×  · × ·    1 ×   2 ×   4 ×  4 ×  4 ×  4",
-                "  ▪     · ×  · ×  8 ×  · ×  · × 4    1 ×   2 ×  32 ×  4 ×  4 × 16",
-                "  ▤     · ×  4 ×  · ×  · ×  · × ·    1 ×   8 ×  32 ×  4 ×  4 × 16",
-                "  ↻     · ×  · ×  · ×  · ×  · × 1    1 ×   8 ×  32 ×  4 ×  4 × 16",
-                "  ▣     2 × 16 ×  4 ×  · ×  · × ·    2 × 128 × 128 ×  4 ×  4 × 16",
+                "  ◦                     · ×  · ×  · ×  · ×  · × ·    1 ×   2 ×   4 ×  4 ×  4 ×  4",
+                "  ▪  32 lanes           · ×  · ×  8 ×  · ×  · × 4    1 ×   2 ×  32 ×  4 ×  4 × 16",
+                "  ▤  4 planes a cube    · ×  4 ×  · ×  · ×  · × ·    1 ×   8 ×  32 ×  4 ×  4 × 16",
+                "  ↻  1 steps            · ×  · ×  · ×  · ×  · × 1    1 ×   8 ×  32 ×  4 ×  4 × 16",
+                "  ▣  128 cubes          2 × 16 ×  4 ×  · ×  · × ·    2 × 128 × 128 ×  4 ×  4 × 16",
                 "",
-                "        └─ count ───────────────┘    └─ tile ───────────────────┘",
+                "                        └─ count ───────────────┘    └─ tile ───────────────────┘",
             ]
             .join("\n")
         );
@@ -217,17 +217,17 @@ mod tests {
     #[test]
     fn a_channel_axis_wider_than_a_plane_walks_its_blocks() {
         assert_eq!(
-            plan(256).partitioning().labelled(&LABELS).to_string(),
+            plan(256).partitioning().table(&LABELS).to_string(),
             [
-                "        b × oh × ow × th × tw ×  c    b ×  oh ×  ow × th × tw ×   c",
+                "                        b × oh × ow × th × tw ×  c    b ×  oh ×  ow × th × tw ×   c",
                 "",
-                "  ◦     · ×  · ×  · ×  · ×  · ×  ·    1 ×   2 ×   4 ×  4 ×  4 ×   4",
-                "  ▪     · ×  · ×  · ×  · ×  · × 32    1 ×   2 ×   4 ×  4 ×  4 × 128",
-                "  ▤     · ×  4 ×  · ×  · ×  · ×  ·    1 ×   8 ×   4 ×  4 ×  4 × 128",
-                "  ↻     · ×  · ×  · ×  · ×  · ×  2    1 ×   8 ×   4 ×  4 ×  4 × 256",
-                "  ▣     2 × 16 × 32 ×  · ×  · ×  ·    2 × 128 × 128 ×  4 ×  4 × 256",
+                "  ◦                     · ×  · ×  · ×  · ×  · ×  ·    1 ×   2 ×   4 ×  4 ×  4 ×   4",
+                "  ▪  32 lanes           · ×  · ×  · ×  · ×  · × 32    1 ×   2 ×   4 ×  4 ×  4 × 128",
+                "  ▤  4 planes a cube    · ×  4 ×  · ×  · ×  · ×  ·    1 ×   8 ×   4 ×  4 ×  4 × 128",
+                "  ↻  2 steps            · ×  · ×  · ×  · ×  · ×  2    1 ×   8 ×   4 ×  4 ×  4 × 256",
+                "  ▣  1024 cubes         2 × 16 × 32 ×  · ×  · ×  ·    2 × 128 × 128 ×  4 ×  4 × 256",
                 "",
-                "        └─ count ────────────────┘    └─ tile ────────────────────┘",
+                "                        └─ count ────────────────┘    └─ tile ────────────────────┘",
             ]
             .join("\n")
         );

@@ -8,6 +8,7 @@
 //! number carried beside a lookup.
 #![allow(non_snake_case)]
 
+use super::{Form, implied};
 use cubecl::{prelude::*, zspace::Shape};
 use cubek_test_utils::{HostData, HostDataType, TestInput};
 use cubek_tile::*;
@@ -83,7 +84,7 @@ fn run(table: &[u32]) -> HostData {
     let f32_ty = f32::elem_type_native();
     let u32_ty = u32::elem_type_native();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[
@@ -93,13 +94,13 @@ fn run(table: &[u32]) -> HostData {
                 (OFFSET, PAGE_SIZE),
                 (D, FEATURES),
             ]),
-            Tiling::leaf(&[(B, 1), (LP, 1), (PAGE, 1)])
+            Levels::leaf(&[(B, 1), (LP, 1), (PAGE, 1)])
                 .walk_every(&[PAGE])
                 .walk_every(&[LP])
                 .walk_every(&[B])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     let (kv_handle, _) = TestInput::builder(client.clone(), Shape::new([SLOTS, FEATURES]))
@@ -136,9 +137,9 @@ fn run(table: &[u32]) -> HostData {
         ),
         table_handle.binding().into_tensor_arg(),
         launcher.partitioning_arg(),
-        launcher.level(0),
-        launcher.level(1),
-        launcher.level(2),
+        launcher.partitioning().level(0),
+        launcher.partitioning().level(1),
+        launcher.partitioning().level(2),
         f32_ty,
     );
 

@@ -2,6 +2,7 @@
 
 use core::f32::consts::PI;
 
+use super::{Form, implied};
 use cubecl::{prelude::*, std::tensor::TensorHandle, zspace::shape};
 use cubecl_common::{ComptimeFloat, Ratio};
 use cubek_test_utils::{HostData, HostDataType, TestInput};
@@ -77,17 +78,18 @@ fn product_kernel_in_place<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Product<AffineCoordinate<E>, AffineCoordinate<E>>>(
+    let source = Procedural::<E>::new::<Product<AffineCoordinate<E>, AffineCoordinate<E>>>(
         comptime!(space.space().clone()),
         product_of(
             affine_along(ROW, E::from_int(0), E::from_int(1)),
             affine_along(COL, E::from_int(0), E::from_int(1)),
         ),
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
-/// The same recipe materialized into shared memory first: a ring of one slot fills each region's
+/// The same recipe materialized into shared memory first: one slot fills each region's
 /// window cooperatively, and the output copies the stage. The grid must be the same either way.
 #[cube(launch)]
 fn product_kernel_staged<E: Float>(
@@ -96,17 +98,18 @@ fn product_kernel_staged<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Product<AffineCoordinate<E>, AffineCoordinate<E>>>(
+    let source = Procedural::<E>::new::<Product<AffineCoordinate<E>, AffineCoordinate<E>>>(
         comptime!(space.space().clone()),
         product_of(
             affine_along(ROW, E::from_int(0), E::from_int(1)),
             affine_along(COL, E::from_int(0), E::from_int(1)),
         ),
-    );
+    )
+    .tile();
     let output = output.tile(comptime!(space.clone()));
     let walk = source.over(&level);
-    let mut ring = Ring::smem_single(&walk, &source, StageStorage::Strided, 1usize);
-    pipelined(walk, &mut ring, |slot, region| {
+    let mut stages = Stages::smem_single(&walk, &source, StageStorage::Strided, 1usize);
+    stages.pipelined(walk, |slot, region| {
         let mut output_region = output.at(region);
         slot.consume(|staged| {
             output_region.copy_from(staged);
@@ -123,7 +126,7 @@ fn affine_plus_phase<E: Float>(
     offset: i32,
     divisor: u32,
 ) -> Tile<E> {
-    Tile::<E>::procedural::<Sum<AffineCoordinate<E>, Phase<E>>>(
+    Procedural::<E>::new::<Sum<AffineCoordinate<E>, Phase<E>>>(
         space,
         sum_of(
             affine_along(ROW, E::from_int(0), runtime_scalar::<E>(E::new(1.0_f32))),
@@ -136,6 +139,7 @@ fn affine_plus_phase<E: Float>(
             },
         ),
     )
+    .tile()
 }
 
 /// `launch_ratio` decides whether the fraction is spelled in constants, which fold at expand time,
@@ -169,13 +173,14 @@ fn rebase_kernel<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<AxisValue>(
+    let source = Procedural::<E>::new::<AxisValue>(
         comptime!(space.space().clone()),
         AxisValue {
             axis: ROW,
             scale: 2.0,
         },
-    );
+    )
+    .tile();
     // The second region starts at (2, 3), so its first logical coordinate reads row 2.
     let region = Region::trailing(
         comptime!(0usize),
@@ -189,7 +194,7 @@ fn rebase_kernel<E: Float>(
     pos.push(0u32.runtime());
     pos.push(0u32.runtime());
     let mut output = output.tile(comptime!(space.clone()));
-    output.init(source.procedural_value(pos));
+    output.init(source.value_at(pos));
 }
 
 #[cube(launch)]
@@ -199,12 +204,13 @@ fn constant_kernel<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Constant<E>>(
+    let source = Procedural::<E>::new::<Constant<E>>(
         comptime!(space.space().clone()),
         Constant::<E> {
             value: runtime_scalar::<E>(E::new(-1.25_f32)),
         },
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -216,10 +222,11 @@ fn affine_kernel<E: Float>(
     #[comptime] offset: ComptimeFloat<f32>,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<AffineCoordinate<E>>(
+    let source = Procedural::<E>::new::<AffineCoordinate<E>>(
         comptime!(space.space().clone()),
         along_col::<E>(offset),
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -231,14 +238,15 @@ fn linear_kernel<E: Float>(
     #[comptime] offset: ComptimeFloat<f32>,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<LinearAxis<E>>(
+    let source = Procedural::<E>::new::<LinearAxis<E>>(
         comptime!(space.space().clone()),
         linear_along(
             COL,
             runtime_scalar::<E>(E::new(comptime!(offset.get()))),
             runtime_scalar::<E>(E::new(1.0_f32)),
         ),
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -251,7 +259,7 @@ fn cubic_kernel<E: Float>(
     #[comptime] a: Ratio,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<CubicAxis<E>>(
+    let source = Procedural::<E>::new::<CubicAxis<E>>(
         comptime!(space.space().clone()),
         cubic_along(
             COL,
@@ -259,7 +267,8 @@ fn cubic_kernel<E: Float>(
             runtime_scalar::<E>(E::new(1.0_f32)),
             a,
         ),
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -272,7 +281,7 @@ fn lanczos_kernel<E: Float>(
     #[comptime] lobes: u8,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<LanczosAxis<E>>(
+    let source = Procedural::<E>::new::<LanczosAxis<E>>(
         comptime!(space.space().clone()),
         lanczos_along(
             COL,
@@ -280,7 +289,8 @@ fn lanczos_kernel<E: Float>(
             runtime_scalar::<E>(E::new(1.0_f32)),
             lobes,
         ),
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -293,7 +303,7 @@ fn linear_over_axis_value_kernel<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<LinearScaled>(
+    let source = Procedural::<E>::new::<LinearScaled>(
         comptime!(space.space().clone()),
         LinearScaled {
             coordinate: AxisValue {
@@ -301,7 +311,8 @@ fn linear_over_axis_value_kernel<E: Float>(
                 scale: 0.5,
             },
         },
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -314,12 +325,13 @@ fn integer_kernel<E: Int>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Constant<E>>(
+    let source = Procedural::<E>::new::<Constant<E>>(
         comptime!(space.space().clone()),
         Constant::<E> {
             value: runtime_scalar::<E>(E::new(7)),
         },
-    );
+    )
+    .tile();
     materialize(&source, output, &space, level.clone());
 }
 
@@ -330,12 +342,13 @@ fn direct_copy_kernel<E: Float>(
     space: Partitioning,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Constant<E>>(
+    let source = Procedural::<E>::new::<Constant<E>>(
         comptime!(space.space().clone()),
         Constant::<E> {
             value: runtime_scalar::<E>(E::new(1.0_f32)),
         },
-    );
+    )
+    .tile();
     let mut output = output.tile(comptime!(space.clone()));
     output.copy_from(&source);
 }
@@ -348,12 +361,13 @@ fn divided_direct_copy_kernel<E: Float>(
     #[comptime] level: Level,
     #[define(E)] _dtype: ElemType,
 ) {
-    let source = Tile::<E>::procedural::<Constant<E>>(
+    let source = Procedural::<E>::new::<Constant<E>>(
         comptime!(space.space().clone()),
         Constant::<E> {
             value: runtime_scalar::<E>(E::new(1.0_f32)),
         },
-    );
+    )
+    .tile();
     let region = Region::trailing(
         comptime!(0usize),
         comptime!(space.space().clone()),
@@ -378,15 +392,15 @@ impl Harness {
         Self {
             client: cubecl::test_device().client(),
             dtype: f32::elem_type_native(),
-            launcher: Launcher::implied(
+            launcher: implied(
                 &cubecl::test_device().client(),
                 Partitioning::new(
                     Space::new(&[(ROW, ROWS), (COL, COLS)]),
-                    Tiling::leaf(&[(ROW, 2), (COL, 3)])
+                    Levels::leaf(&[(ROW, 2), (COL, 3)])
                         .walk_every(&[ROW, COL])
-                        .levels(),
+                        .build(),
                 ),
-                KernelForm::Static,
+                Form::Static,
             ),
         }
     }
@@ -452,7 +466,7 @@ fn user_recipe_evaluates_in_place() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         h.dtype,
     );
     assert_grid(&h.read(output), |row, col| (row * col) as f32);
@@ -468,7 +482,7 @@ fn user_recipe_materializes_through_a_staged_walk() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         h.dtype,
     );
     assert_grid(&h.read(output), |row, col| (row * col) as f32);
@@ -484,7 +498,7 @@ fn selecting_a_region_rebases_the_recipe_origin() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         h.dtype,
     );
     assert_grid(&h.read(output), |_, _| 4.0);
@@ -501,7 +515,7 @@ fn check_phase(launch_ratio: bool) {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         launch_ratio,
         h.dtype,
     );
@@ -531,7 +545,7 @@ fn constant_evaluates_its_value_everywhere() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         h.dtype,
     );
     assert_grid(&h.read(output), |_, _| -1.25);
@@ -547,7 +561,7 @@ fn affine_coordinates_evaluate_absolute_positions() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         offset(-2.5),
         h.dtype,
     );
@@ -566,7 +580,7 @@ fn linear_is_a_triangle_with_unit_support() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         offset(-2.5),
         h.dtype,
     );
@@ -592,7 +606,7 @@ fn a_procedural_tile_works_over_an_integer_element_type() {
         launcher.cube_dim(),
         output_arg!(output),
         launcher.partitioning_arg(),
-        launcher.level(0),
+        launcher.partitioning().level(0),
         dtype,
     );
     let got = HostData::from_tensor_handle(&client, output, HostDataType::I32);
@@ -613,7 +627,7 @@ fn a_filter_wraps_any_recipe_not_only_affine_coordinates() {
         h.launcher.cube_dim(),
         output_arg!(output),
         h.launcher.partitioning_arg(),
-        h.launcher.level(0),
+        h.launcher.partitioning().level(0),
         h.dtype,
     );
     // x = row / 2, so the triangle falls to zero at row 2 and stays there.
@@ -636,7 +650,7 @@ fn cubic_matches_the_keys_convolution() {
             h.launcher.cube_dim(),
             output_arg!(output),
             h.launcher.partitioning_arg(),
-            h.launcher.level(0),
+            h.launcher.partitioning().level(0),
             offset(-2.5),
             ratio,
             h.dtype,
@@ -668,7 +682,7 @@ fn lanczos_matches_the_windowed_sinc() {
             h.launcher.cube_dim(),
             output_arg!(output),
             h.launcher.partitioning_arg(),
-            h.launcher.level(0),
+            h.launcher.partitioning().level(0),
             offset(start),
             lobes,
             h.dtype,
@@ -689,15 +703,15 @@ fn lanczos_matches_the_windowed_sinc() {
 fn direct_copy_masks_the_trailing_partial_tile() {
     let client = cubecl::test_device().client();
     let dtype = f32::elem_type_native();
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, ROWS), (COL, COLS)]),
-            Tiling::leaf(&[(ROW, 2), (COL, 4)])
+            Levels::leaf(&[(ROW, 2), (COL, 4)])
                 .walk_every(&[ROW, COL])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
     let output = TestInput::builder(client.clone(), shape![ROWS, COLS])
         .dtype(dtype)
@@ -723,15 +737,15 @@ fn direct_copy_masks_the_trailing_partial_tile() {
 fn divided_direct_copy_preserves_the_parent_bound() {
     let client = cubecl::test_device().client();
     let dtype = f32::elem_type_native();
-    let launch = Launcher::implied(
+    let launch = implied(
         &client,
         Partitioning::new(
             Space::new(&[(ROW, ROWS), (COL, COLS)]),
-            Tiling::leaf(&[(ROW, 2), (COL, 4)])
+            Levels::leaf(&[(ROW, 2), (COL, 4)])
                 .walk_every(&[ROW, COL])
-                .levels(),
+                .build(),
         ),
-        KernelForm::DynamicAlong(&[ROW]),
+        Form::DynamicAlong(&[ROW]),
     );
     let output = TestInput::builder(client.clone(), shape![ROWS, COLS])
         .dtype(dtype)
@@ -744,7 +758,7 @@ fn divided_direct_copy_preserves_the_parent_bound() {
         launch.cube_dim(),
         output_arg!(output),
         launch.partitioning_arg(),
-        launch.level(0),
+        launch.partitioning().level(0),
         dtype,
     );
 

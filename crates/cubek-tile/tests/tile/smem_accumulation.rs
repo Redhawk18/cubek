@@ -14,6 +14,7 @@ use cubecl::{
 };
 use cubek_test_utils::{HostData, HostDataType, TestInput, TestOutcome, ValidationResult};
 
+use super::{Form, implied};
 use cubek_tile::*;
 
 const M: Axis = Axis(0);
@@ -22,7 +23,7 @@ const K: Axis = Axis(2);
 
 const REGISTER_BLOCK: RegisterBlock = RegisterBlock::new(16);
 
-/// One box per cube, its `K` dealt to the cube's planes, each plane's slice added into shared
+/// One box per cube, its `K` distributed to the cube's planes, each plane's slice added into shared
 /// memory and the sum stored once.
 #[cube(launch)]
 fn smem_split_matmul<E: Numeric>(
@@ -45,13 +46,12 @@ fn smem_split_matmul<E: Numeric>(
             let mut partial = sink_plane.block_accumulator::<E, E, E>(
                 &a_plane,
                 &b_plane,
-                comptime!(Fragments::below(&sink_plane, &a_plane)),
                 REGISTER_BLOCK,
                 Monoid::Sum,
             );
             partial.zero();
             partial.mma(&a_plane, &b_plane, Semiring::SUM_PROD);
-            partial.drained_into(&sink_plane, comptime!(None));
+            partial.drained_into(&sink_plane);
         }
         sync_cube();
         c_cube.copy_from(&sum.source);
@@ -69,7 +69,7 @@ fn reference(m: usize, n: usize, k: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `a·b` over boxes of `box_m × box_n`, each box's `K` dealt to `planes` planes of its cube.
+/// `a·b` over boxes of `box_m × box_n`, each box's `K` distributed to `planes` planes of its cube.
 fn run(m: usize, n: usize, k: usize, (box_m, box_n): (usize, usize), planes: usize) -> HostData {
     let client = cubecl::test_device().client();
     let dtype = f32::elem_type_native();
@@ -89,16 +89,16 @@ fn run(m: usize, n: usize, k: usize, (box_m, box_n): (usize, usize), planes: usi
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(M, box_m), (N, box_n), (K, k / planes)])
+            Levels::leaf(&[(M, box_m), (N, box_n), (K, k / planes)])
                 .planes(&[(K, planes)])
                 .cubes(&[M, N])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
 
     smem_split_matmul::launch(
@@ -184,7 +184,7 @@ fn each_cube_folds_only_its_own_box() {
 // -- A fragment written into a window the edge cuts short --------------------------------------
 //
 // A fragment's store intrinsic writes its whole window, so a tile the problem's edge cuts short
-// bounces through the plane's scratch and each lane writes only the cells inside.
+// bounces through the plane's scratch and each unit writes only the cells inside.
 
 /// `c = a · b` in `16×16×16` fragments over boxes that overhang the output, drained into a plain
 /// output that replaces: through [`Tile::drained_into`], or where `copies` through
@@ -195,7 +195,6 @@ fn fragment_matmul_into_a_short_window<EI: Numeric, E: Numeric>(
     b: &TileArg<'_, EI, Const<1>>,
     c: &TileArg<'_, E, Const<1>>,
     space: Partitioning,
-    #[comptime] lanes: usize,
     #[comptime] copies: bool,
     #[define(EI)] _input: ElemType,
     #[define(E)] _output: ElemType,
@@ -208,15 +207,11 @@ fn fragment_matmul_into_a_short_window<EI: Numeric, E: Numeric>(
         let b_cube = b.at(&cube);
         let mut c_cube = c.at(&cube);
         let mut acc = c_cube
-            .cmma_accumulator::<E, EI>(
-                &a_cube,
-                comptime!(Fragments::below(&c_cube, &a_cube)),
-                Monoid::Sum,
-            )
-            .with_scratch(Resident::OneTile, 1usize, lanes);
+            .cmma_accumulator::<E, EI>(&a_cube, Monoid::Sum)
+            .with_scratch(Scratch::OneTile);
         acc.zero();
         let walk = cube.walk();
-        let mut ring = Ring::smem(
+        let mut stages = Stages::smem(
             &walk,
             &a_cube,
             &b_cube,
@@ -225,7 +220,7 @@ fn fragment_matmul_into_a_short_window<EI: Numeric, E: Numeric>(
             }),
             1usize,
         );
-        pipelined(walk, &mut ring, |slot, stage| {
+        stages.pipelined(walk, |slot, stage| {
             let acc_stage = acc.at(stage);
             slot.consume(|a_stage, b_stage| {
                 let a_fragments =
@@ -245,7 +240,7 @@ fn fragment_matmul_into_a_short_window<EI: Numeric, E: Numeric>(
         if comptime!(copies) {
             c_cube.copy_from(&acc);
         } else {
-            acc.drained_into(&c_cube, comptime!(None));
+            acc.drained_into(&c_cube);
         }
     }
 }
@@ -290,7 +285,6 @@ fn short_window_matmul(copies: bool) {
         return;
     }
     let (m, n, k) = (20usize, 24usize, 32usize);
-    let lanes = client.properties().hardware.plane_size_max as usize;
     let input = half::f16::elem_type_native();
     let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 - 3.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 - 2.0).collect();
@@ -307,21 +301,21 @@ fn short_window_matmul(copies: bool) {
         .zeros()
         .generate_without_host_data();
 
-    let launcher = Launcher::implied(
+    let launcher = implied(
         &client,
         Partitioning::new(
             Space::new(&[(M, m), (N, n), (K, k)]),
-            Tiling::leaf(&[(M, 16), (N, 16), (K, 16)])
+            Levels::leaf(&[(M, 16), (N, 16), (K, 16)])
                 .walk(&[(M, 1), (N, 1)])
                 .walk_every(&[K])
                 .cubes(&[M, N])
-                .levels(),
+                .build(),
         ),
-        KernelForm::Static,
+        Form::Static,
     );
     // Bound through the launcher, which reads the overhang off the partitioning and masks the
     // output's writes past its edge.
-    let bind = |binding, axes: &'static [Axis]| launcher.arg(binding).subspace(axes).build();
+    let bind = |binding, axes: &'static [Axis]| launcher.arg(binding).axes(axes).build();
     fragment_matmul_into_a_short_window::launch(
         &client,
         launcher.cube_count(),
@@ -330,7 +324,6 @@ fn short_window_matmul(copies: bool) {
         bind(b_handle.clone().binding(), &[K, N]).arg(),
         bind(out.clone().binding(), &[M, N]).arg(),
         launcher.partitioning_arg(),
-        lanes,
         copies,
         input,
         f32::elem_type_native(),
